@@ -155,19 +155,33 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 		}
 
 		// Eliminate any higher variables in curMask using existing subsequent pivots
-		for k := 1; k < 256; k++ {
-			if !curMask.TestBit(k) {
-				continue
+		for w := 0; w < 4; w++ {
+			minBit := 0
+			if w == 0 {
+				minBit = 1 // Skip bit 0 (leading variable)
 			}
-			subSeq := curSeq + uint64(k)
-			subP := &d.pivots[subSeq%uint64(d.capacity)]
-			if subP.active && subP.seq == subSeq {
-				shifted := subP.mask.ShiftLeft(k)
-				curMask.XOR(shifted)
-				XORBytes(scratch, subP.data, subP.len)
-				if subP.len > payloadLen {
-					payloadLen = subP.len
+			for minBit < 64 {
+				var mask uint64
+				if minBit > 0 {
+					mask = (^uint64(0)) >> (64 - minBit)
 				}
+				word := curMask[w] &^ mask
+				if word == 0 {
+					break
+				}
+				t := bits.TrailingZeros64(word)
+				k := w*64 + t
+				subSeq := curSeq + uint64(k)
+				subP := &d.pivots[subSeq%uint64(d.capacity)]
+				if subP.active && subP.seq == subSeq {
+					shifted := subP.mask.ShiftLeft(k)
+					curMask.XOR(shifted)
+					XORBytes(scratch, subP.data, subP.len)
+					if subP.len > payloadLen {
+						payloadLen = subP.len
+					}
+				}
+				minBit = t + 1
 			}
 		}
 
