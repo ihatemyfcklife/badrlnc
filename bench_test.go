@@ -76,7 +76,12 @@ func BenchmarkEncoder_GenerateParity_ZeroAlloc(b *testing.B) {
 // achieves strictly 0 heap allocations per operation with ZeroCopy enabled.
 func BenchmarkSystematicFastPath_ZeroAlloc(b *testing.B) {
 	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
-	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 2048, SymbolSize: 1400, ZeroCopy: true})
+	dec := NewIncrementalDecoder(DecoderConfig{
+		Capacity:   2048,
+		SymbolSize: 1400,
+		ZeroCopy:   true,
+		OnDecoded:  func(seq uint64, pkt []byte) {},
+	})
 	payload := make([]byte, 1200)
 	_, _ = rand.Read(payload)
 
@@ -93,7 +98,12 @@ func BenchmarkSystematicFastPath_ZeroAlloc(b *testing.B) {
 // and reports throughput in packets/sec (Kpps).
 func BenchmarkDecoder_IncrementalRREF_Kpps(b *testing.B) {
 	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
-	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 2048, SymbolSize: 1400, ZeroCopy: true})
+	dec := NewIncrementalDecoder(DecoderConfig{
+		Capacity:   2048,
+		SymbolSize: 1400,
+		ZeroCopy:   true,
+		OnDecoded:  func(seq uint64, pkt []byte) {},
+	})
 	payload := make([]byte, 1200)
 	_, _ = rand.Read(payload)
 

@@ -286,10 +286,7 @@ func (d *IncrementalDecoder) recordAndEmitSolved(seq uint64, data []byte) {
 		d.onDecoded(seq, recoveredPayload)
 	}
 
-	if d.zeroCopy {
-		// Zero-allocation: points to internal buffer
-		d.recoveredScratch = append(d.recoveredScratch, recoveredPayload)
-	} else {
+	if !d.zeroCopy {
 		// Safe clone: caller owns memory
 		cp := make([]byte, pktLen)
 		copy(cp, recoveredPayload)

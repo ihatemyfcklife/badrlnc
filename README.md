@@ -117,29 +117,30 @@ import (
 )
 
 func main() {
-	// Mode A (Recommended for high-performance streaming pipelines):
-	// Use OnDecoded callback for safe, zero-copy packet emission without slice aliasing.
-	decoder := rlnc.NewIncrementalDecoder(rlnc.DecoderConfig{
+	// Mode A: Zero-Copy Streaming (0 heap allocations, safe against aliasing):
+	// Requires OnDecoded. PushShard returns (nil, nil) to prevent slice aliasing.
+	decoderZero := rlnc.NewIncrementalDecoder(rlnc.DecoderConfig{
 		Capacity:   2048,
 		SymbolSize: 1400,
 		ZeroCopy:   true,
 		OnDecoded: func(seq uint64, packet []byte) {
+			// Zero-copy delivery: packet points directly to internal ring buffer
 			fmt.Printf("Streamed Packet #%d: %s\n", seq, string(packet))
 		},
 	})
+	_, _ = decoderZero.PushShard(shard)
 
-	// Shards can be received out of order or after packet drops
-	var shard rlnc.Shard
-	_, err := decoder.PushShard(shard)
-	if err != nil {
-		panic(err)
+	// Mode B: Default Safe Mode (PushShard returns independent cloned slices):
+	decoderSafe := rlnc.NewIncrementalDecoder(rlnc.DecoderConfig{
+		Capacity:   2048,
+		SymbolSize: 1400,
+		ZeroCopy:   false, // default
+	})
+	recoveredPackets, err := decoderSafe.PushShard(shard)
+	for _, pkt := range recoveredPackets {
+		// Safe to retain, queue, or send across goroutines indefinitely
+		fmt.Printf("Recovered Packet: %s\n", string(pkt))
 	}
-
-	// Mode B (Batch return via PushShard):
-	// - ZeroCopy: false (default): returned [][]byte and its payloads are fresh heap copies.
-	// - ZeroCopy: true: returned [][]byte is an internal scratch slice (d.recoveredScratch).
-	//   Both the outer slice and its byte buffers are reset on the very next PushShard call!
-	//   Process them synchronously within the loop, or use Mode A (OnDecoded) above.
 }
 ```
 

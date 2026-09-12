@@ -572,7 +572,7 @@ func TestDecoder_ZeroCopyVsSafe_Aliasing(t *testing.T) {
 		t.Fatalf("safe mode violated: rec1Safe corrupted to %q", rec1Safe[0])
 	}
 
-	// Zero-copy mode with OnDecoded callback (recommended pattern)
+	// Zero-copy mode with OnDecoded callback (strictly enforced)
 	var streamedPackets [][]byte
 	decZero := NewIncrementalDecoder(DecoderConfig{
 		Capacity:   16,
@@ -585,8 +585,14 @@ func TestDecoder_ZeroCopyVsSafe_Aliasing(t *testing.T) {
 		},
 	})
 
-	_, _ = decZero.PushShard(s0)
-	_, _ = decZero.PushShard(s1)
+	rec0Zero, err := decZero.PushShard(s0)
+	if err != nil || rec0Zero != nil {
+		t.Fatalf("expected nil returned slice in ZeroCopy mode, got %v", rec0Zero)
+	}
+	rec1Zero, err := decZero.PushShard(s1)
+	if err != nil || rec1Zero != nil {
+		t.Fatalf("expected nil returned slice in ZeroCopy mode, got %v", rec1Zero)
+	}
 
 	if len(streamedPackets) != 2 {
 		t.Fatalf("expected 2 streamed packets via OnDecoded, got %d", len(streamedPackets))
@@ -594,5 +600,16 @@ func TestDecoder_ZeroCopyVsSafe_Aliasing(t *testing.T) {
 	if !bytes.Equal(streamedPackets[0], pkt0) || !bytes.Equal(streamedPackets[1], pkt1) {
 		t.Fatalf("streamed packet mismatch")
 	}
+}
+
+// 14. Test that ZeroCopy without OnDecoded panics at construction
+func TestDecoder_ZeroCopy_RequiresOnDecodedPanic(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic when ZeroCopy is true and OnDecoded is nil")
+		}
+	}()
+	_ = NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100, ZeroCopy: true, OnDecoded: nil})
 }
 

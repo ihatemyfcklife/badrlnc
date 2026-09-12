@@ -20,26 +20,22 @@ type DecoderConfig struct {
 	// Default is 150ms.
 	InactivityTimeout time.Duration
 
-	// ZeroCopy enables zero-allocation packet delivery in PushShard.
+	// ZeroCopy enables strictly 0-allocation packet delivery via OnDecoded streaming.
 	//
-	// WARNING (Slice & Buffer Aliasing):
-	// When true, PushShard returns its internal scratch slice ([][]byte) whose elements point
-	// directly to internal decoder ring buffers (0 allocs/op).
-	// Crucially, BOTH the returned outer slice ([][]byte) AND its underlying memory are
-	// reset and overwritten on the very next call to PushShard.
+	// Safety & Aliasing Guarantee:
+	// To eliminate silent memory corruption and slice aliasing bugs, ZeroCopy mode
+	// requires configuring the OnDecoded callback (NewIncrementalDecoder will panic
+	// if ZeroCopy is true and OnDecoded is nil).
 	//
-	// Recommended Alternatives:
-	//   1. For event-driven zero-copy streaming, configure OnDecoded(seq, packet) instead.
-	//      OnDecoded delivers packets immediately as they are solved without slice aliasing.
-	//   2. If using PushShard with ZeroCopy: true, process the returned [][]byte synchronously
-	//      before calling PushShard again, or make an explicit copy if retaining across calls.
-	//
-	// When false (default), each recovered packet and the outer slice are safely cloned into
-	// independent heap allocations.
+	// Behavior:
+	//   - ZeroCopy: true: Recovered packets are streamed directly to OnDecoded without
+	//     allocating slices. PushShard returns (nil, nil) with strictly 0 heap allocations.
+	//   - ZeroCopy: false (default): Recovered packets and the outer slice are safely cloned
+	//     into fresh heap allocations and returned from PushShard.
 	ZeroCopy bool
 
-	// OnDecoded is an optional callback invoked immediately when a source packet is recovered.
-	// Recommended for high-performance streaming pipelines under ZeroCopy mode.
+	// OnDecoded is invoked immediately when a source packet is recovered.
+	// Required when ZeroCopy is true; optional in default safe mode.
 	OnDecoded func(seq uint64, packet []byte)
 }
 
@@ -89,6 +85,10 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 		solved[i].data = make([]byte, internalSymbolCapacity)
 	}
 
+	if cfg.ZeroCopy && cfg.OnDecoded == nil {
+		panic("rlnc: ZeroCopy mode requires configuring OnDecoded callback to prevent slice aliasing")
+	}
+
 	return &IncrementalDecoder{
 		capacity:          capacity,
 		symbolSize:        symbolSize,
@@ -107,15 +107,12 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 // elimination over GF(2), cascades back-substitution into older pivots, and returns any packets
 // recovered during this step.
 //
-// Memory Lifetime & ZeroCopy Semantics:
-//   - Default (ZeroCopy: false): Both the outer slice ([][]byte) and each packet ([]byte) are
-//     freshly allocated copies. Safe to store, queue, or retain indefinitely.
-//   - ZeroCopy (ZeroCopy: true): Strictly 0 heap allocations. The returned slice ([][]byte)
-//     is an internal reusable scratch buffer (d.recoveredScratch). Its backing array and elements
-//     are reset and overwritten on the very next call to PushShard.
-//     Do NOT retain the returned [][]byte slice across calls to PushShard!
-//     Instead, either process the returned packets synchronously within the same loop,
-//     or configure DecoderConfig.OnDecoded for idiomatic, event-driven zero-copy streaming.
+// Delivery & Memory Modes:
+//   - ZeroCopy: false (default): PushShard returns recovered packets as freshly cloned slices ([][]byte).
+//     Each packet is an independent heap copy safe to retain, queue, or pass to async workers.
+//   - ZeroCopy: true: Strictly 0 heap allocations. Recovered packets are delivered exclusively
+//     and immediately through the configured OnDecoded callback. PushShard returns (nil, nil)
+//     to prevent any possibility of slice aliasing or use-after-free bugs.
 func (d *IncrementalDecoder) PushShard(shard Shard) (recovered [][]byte, err error) {
 	if len(shard.Data) == 0 {
 		return nil, ErrZeroPayload
@@ -128,17 +125,15 @@ func (d *IncrementalDecoder) PushShard(shard Shard) (recovered [][]byte, err err
 	defer d.mu.Unlock()
 
 	d.shardsReceived.Add(1)
-	d.recoveredScratch = d.recoveredScratch[:0]
+	if !d.zeroCopy {
+		d.recoveredScratch = d.recoveredScratch[:0]
+	}
 
 	// Process shard through the incremental Gauss-Jordan solver
 	d.processShardLocked(shard)
 
-	if len(d.recoveredScratch) == 0 {
+	if d.zeroCopy || len(d.recoveredScratch) == 0 {
 		return nil, nil
-	}
-
-	if d.zeroCopy {
-		return d.recoveredScratch, nil
 	}
 
 	res := make([][]byte, len(d.recoveredScratch))
