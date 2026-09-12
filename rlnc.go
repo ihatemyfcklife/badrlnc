@@ -3,6 +3,7 @@ package rlnc
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 )
 
 const (
@@ -11,9 +12,9 @@ const (
 	//  [0..7]   : BaseSeq  (uint64 BigEndian) - Base packet sequence number for bit 0 of Mask
 	//  [8..15]  : Mask[0]  (uint64 BigEndian) - Primary 64-bit GF(2) linear combination bitmask
 	//  [16..17] : DataLen  (uint16 BigEndian) - Byte length of the shard payload
-	//  [18]     : Flags    (uint8)            - Bit 0: FlagParity, Bit 1: FlagExtendedMask
+	//  [18]     : Flags    (uint8)            - Bit 0: FlagParity, Bit 1: FlagExtendedMask, Bit 2: FlagChecksum
 	//  [19]     : Version  (uint8)            - Protocol Version (0x01)
-	//  [20..23] : Reserved (uint32 BigEndian) - Alignment and future extensions
+	//  [20..23] : Checksum / Reserved (uint32 BigEndian) - CRC32-Castagnoli checksum when FlagChecksum is set; otherwise 0
 	CompactHeaderSize = 24
 
 	// ExtendedHeaderSize is the size in bytes of the RLNC shard header for 256-bit masks.
@@ -32,6 +33,9 @@ const (
 
 	// FlagExtendedMask indicates that the shard header contains a 256-bit Bitset256 mask (48 bytes).
 	FlagExtendedMask = 0x02
+
+	// FlagChecksum indicates that bytes [20..23] contain a CRC32-Castagnoli checksum of the header and payload.
+	FlagChecksum = 0x04
 
 	// LengthPrefixSize is the 2-byte prefix storing variable-length packet size inside the GF(2) symbol.
 	LengthPrefixSize = 2
@@ -62,7 +66,10 @@ var (
 	ErrSequenceOutOfWindow = errors.New("rlnc: sequence number is outside active window")
 	ErrNoPivotsAvailable   = errors.New("rlnc: no linear pivots available")
 	ErrLinearlyDependent   = errors.New("rlnc: symbol is linearly dependent (zero innovation)")
+	ErrChecksumMismatch    = errors.New("rlnc: shard checksum mismatch (data corruption detected)")
 )
+
+var crc32CastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 // Shard represents a generic, self-contained Random Linear Network Coding symbol.
 // It encapsulates the base sequence number, the GF(2) innovation bitmask, and the payload.
@@ -71,6 +78,7 @@ type Shard struct {
 	Mask     Bitset256
 	Data     []byte
 	IsParity bool
+	Checksum bool
 }
 
 // SystematicShard is an alias for Shard representing an uncoded source symbol (Mask weight = 1).
@@ -110,6 +118,7 @@ func (s Shard) Clone() Shard {
 		Mask:     s.Mask,
 		Data:     cp,
 		IsParity: s.IsParity,
+		Checksum: s.Checksum,
 	}
 }
 
@@ -139,9 +148,11 @@ func (s Shard) EncodeTo(dst []byte) (int, error) {
 	if hdrSize == ExtendedHeaderSize {
 		flags |= FlagExtendedMask
 	}
+	if s.Checksum {
+		flags |= FlagChecksum
+	}
 	dst[18] = flags
 	dst[19] = ProtocolVersion1
-	binary.BigEndian.PutUint32(dst[20:24], 0) // Reserved
 
 	if hdrSize == ExtendedHeaderSize {
 		binary.BigEndian.PutUint64(dst[24:32], s.Mask[1])
@@ -150,6 +161,17 @@ func (s Shard) EncodeTo(dst []byte) (int, error) {
 	}
 
 	copy(dst[hdrSize:totalLen], s.Data)
+
+	if s.Checksum {
+		crc := crc32.Checksum(dst[0:20], crc32CastagnoliTable)
+		if totalLen > 24 {
+			crc = crc32.Update(crc, crc32CastagnoliTable, dst[24:totalLen])
+		}
+		binary.BigEndian.PutUint32(dst[20:24], crc)
+	} else {
+		binary.BigEndian.PutUint32(dst[20:24], 0) // Reserved
+	}
+
 	return totalLen, nil
 }
 
@@ -177,6 +199,7 @@ func DecodeShard(src []byte) (Shard, error) {
 	}
 
 	flags := src[18]
+	hasChecksum := (flags & FlagChecksum) != 0
 	hdrSize := CompactHeaderSize
 	if (flags & FlagExtendedMask) != 0 {
 		hdrSize = ExtendedHeaderSize
@@ -190,6 +213,17 @@ func DecodeShard(src []byte) (Shard, error) {
 	expectedLen := hdrSize + dataLen
 	if len(src) < expectedLen {
 		return Shard{}, ErrCorruptHeader
+	}
+
+	if hasChecksum {
+		expectedCRC := binary.BigEndian.Uint32(src[20:24])
+		crc := crc32.Checksum(src[0:20], crc32CastagnoliTable)
+		if expectedLen > 24 {
+			crc = crc32.Update(crc, crc32CastagnoliTable, src[24:expectedLen])
+		}
+		if crc != expectedCRC {
+			return Shard{}, ErrChecksumMismatch
+		}
 	}
 
 	baseSeq := binary.BigEndian.Uint64(src[0:8])
@@ -207,6 +241,7 @@ func DecodeShard(src []byte) (Shard, error) {
 		Mask:     mask,
 		Data:     src[hdrSize:expectedLen],
 		IsParity: (flags & FlagParity) != 0,
+		Checksum: hasChecksum,
 	}, nil
 }
 

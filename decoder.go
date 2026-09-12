@@ -61,6 +61,7 @@ type IncrementalDecoder struct {
 	shardsInnovative atomic.Uint64
 	shardsRedundant  atomic.Uint64
 	packetsDecoded   atomic.Uint64
+	pivotsEvicted    atomic.Uint64
 }
 
 // NewIncrementalDecoder creates an IncrementalDecoder with the specified configuration.
@@ -192,7 +193,13 @@ func (d *IncrementalDecoder) Reset() {
 	d.shardsInnovative.Store(0)
 	d.shardsRedundant.Store(0)
 	d.packetsDecoded.Store(0)
+	d.pivotsEvicted.Store(0)
 	d.recoveredScratch = d.recoveredScratch[:0]
+}
+
+// PivotsEvicted returns the total number of active, unsolved pivots evicted due to ring buffer capacity wrap-around.
+func (d *IncrementalDecoder) PivotsEvicted() uint64 {
+	return d.pivotsEvicted.Load()
 }
 
 // Stats returns decoder telemetry: total shards received, innovative shards, redundant shards,

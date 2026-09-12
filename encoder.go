@@ -32,6 +32,11 @@ type EncoderConfig struct {
 	//   Strictly 0 heap allocations on Push() and GenerateParity().
 	//   Callers must clone or serialize before subsequent encoder calls.
 	ZeroCopy bool
+
+	// Checksum enables automatic CRC32-Castagnoli checksum generation for all emitted shards.
+	// When enabled, shards are encoded with FlagChecksum (0x04) in wire headers,
+	// enabling DecodeShard to detect bit flips and pollution attacks with hardware acceleration.
+	Checksum bool
 }
 
 type encoderEntry struct {
@@ -51,6 +56,7 @@ type SlidingWindowEncoder struct {
 	symbolSize        int
 	inactivityTimeout time.Duration
 	zeroCopy          bool
+	checksum          bool
 	entries           []encoderEntry
 	nextSeq           uint64
 	totalIn           atomic.Uint64
@@ -96,6 +102,7 @@ func NewSlidingEncoder(cfg EncoderConfig) *SlidingWindowEncoder {
 		symbolSize:        symbolSize,
 		inactivityTimeout: inactivityTimeout,
 		zeroCopy:          cfg.ZeroCopy,
+		checksum:          cfg.Checksum,
 		entries:           entries,
 		nextSeq:           0,
 		rngState:          seed,
@@ -165,6 +172,7 @@ func (e *SlidingWindowEncoder) Push(payload []byte) (SystematicShard, error) {
 		Mask:     NewBitset256FromUint64(1),
 		Data:     outData,
 		IsParity: false,
+		Checksum: e.checksum,
 	}, nil
 }
 
@@ -293,6 +301,7 @@ func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 		Mask:     mask,
 		Data:     outData,
 		IsParity: true,
+		Checksum: e.checksum,
 	}, nil
 }
 

@@ -11,6 +11,26 @@ type reseqItem struct {
 	isPooled bool
 }
 
+// ResequencerConfig defines configuration parameters for InOrderResequencer.
+type ResequencerConfig struct {
+	// MaxWait specifies the maximum duration to wait for a missing sequence number before skipping (default 15ms).
+	MaxWait time.Duration
+
+	// MaxPending specifies the maximum capacity of pending out-of-order buffer before forced skip (default 1024).
+	MaxPending int
+
+	// ZeroCopy specifies whether emitted packets reuse internal / pooled buffers.
+	// When false (default): packets emitted to OnEmit are freshly cloned slices.
+	//   The caller owns the memory and can retain, queue, or send across goroutines indefinitely.
+	// When true: packets emitted to OnEmit point directly to internal ephemeral or pooled slices.
+	//   Strictly 0 heap allocations. Pooled buffers are recycled via PutPacketBuffer immediately
+	//   after OnEmit returns; callers must copy if they need to retain the data.
+	ZeroCopy bool
+
+	// OnEmit is invoked with the packet and its sequence number strictly in order.
+	OnEmit func(seq uint64, packet []byte)
+}
+
 // InOrderResequencer guarantees strictly monotonic in-order packet delivery.
 // In asymmetric multi-path routing or delayed RLNC Gaussian substitution, packets may arrive with slight jitter.
 // By reordering packets before delivering to the higher layer (e.g. TUN device or TCP stack),
@@ -20,6 +40,7 @@ type InOrderResequencer struct {
 	mu          sync.Mutex
 	maxWait     time.Duration
 	maxPending  int
+	zeroCopy    bool
 	expectedSeq uint64
 	initialized bool
 	pending     map[uint64][]byte
@@ -35,14 +56,13 @@ type InOrderResequencer struct {
 	gapsSkipped uint64
 }
 
-// NewInOrderResequencer initializes an InOrderResequencer.
-//   - maxWait: maximum duration to wait for a missing sequence number before skipping (default 15ms).
-//   - maxPending: maximum capacity of pending out-of-order buffer before forced skip (default 1024).
-//   - onEmit: callback invoked with the packet and its sequence number strictly in order.
-func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(seq uint64, packet []byte)) *InOrderResequencer {
+// NewInOrderResequencerWithConfig initializes an InOrderResequencer with full configuration options.
+func NewInOrderResequencerWithConfig(cfg ResequencerConfig) *InOrderResequencer {
+	maxWait := cfg.MaxWait
 	if maxWait <= 0 {
 		maxWait = 15 * time.Millisecond
 	}
+	maxPending := cfg.MaxPending
 	if maxPending <= 0 {
 		maxPending = 1024
 	}
@@ -50,14 +70,28 @@ func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(se
 	r := &InOrderResequencer{
 		maxWait:     maxWait,
 		maxPending:  maxPending,
+		zeroCopy:    cfg.ZeroCopy,
 		pending:     make(map[uint64][]byte),
-		onEmit:      onEmit,
+		onEmit:      cfg.OnEmit,
 		pendingEmit: make([]reseqItem, 0, 16),
 	}
 	for i := range r.emittedRing {
 		r.emittedRing[i] = ^uint64(0)
 	}
 	return r
+}
+
+// NewInOrderResequencer initializes an InOrderResequencer with safe memory ownership by default.
+//   - maxWait: maximum duration to wait for a missing sequence number before skipping (default 15ms).
+//   - maxPending: maximum capacity of pending out-of-order buffer before forced skip (default 1024).
+//   - onEmit: callback invoked with the packet and its sequence number strictly in order.
+func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(seq uint64, packet []byte)) *InOrderResequencer {
+	return NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:    maxWait,
+		MaxPending: maxPending,
+		ZeroCopy:   false,
+		OnEmit:     onEmit,
+	})
 }
 
 // Push ingests a decoded packet. If it matches expectedSeq, it is emitted immediately on the 0-delay fast path.
@@ -145,7 +179,14 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 	// Invoke callback outside mutex lock and return buffers to pool
 	for i := range toEmit {
 		if r.onEmit != nil {
-			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+			var out []byte
+			if r.zeroCopy {
+				out = toEmit[i].pkt
+			} else {
+				out = make([]byte, len(toEmit[i].pkt))
+				copy(out, toEmit[i].pkt)
+			}
+			r.onEmit(toEmit[i].seq, out)
 		}
 		if toEmit[i].isPooled {
 			PutPacketBuffer(toEmit[i].pkt)
@@ -181,7 +222,14 @@ func (r *InOrderResequencer) onTimeout() {
 
 	for i := range toEmit {
 		if r.onEmit != nil {
-			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+			var out []byte
+			if r.zeroCopy {
+				out = toEmit[i].pkt
+			} else {
+				out = make([]byte, len(toEmit[i].pkt))
+				copy(out, toEmit[i].pkt)
+			}
+			r.onEmit(toEmit[i].seq, out)
 		}
 		if toEmit[i].isPooled {
 			PutPacketBuffer(toEmit[i].pkt)

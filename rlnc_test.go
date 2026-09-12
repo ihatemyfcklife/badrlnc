@@ -845,6 +845,359 @@ func TestGaussJordan_SolvedRingBit0Reduction(t *testing.T) {
 	}
 }
 
+// 21. Test that variable-sized packets in carryOverBuf reduction do not panic or truncate data
+func TestGaussJordan_CarryOverVariableSizePacketPanic(t *testing.T) {
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 1400})
+
+	pkt0 := bytes.Repeat([]byte("A"), 50)
+	pkt1 := bytes.Repeat([]byte("B"), 200)
+	pkt2 := bytes.Repeat([]byte("C"), 600)
+
+	// Build Parity B = pkt1 ^ pkt2 (BaseSeq = 1, mask = 0b11 => seq 1 and seq 2)
+	// Encoded representation: LengthPrefix (2 bytes) + data
+	sym1 := make([]byte, LengthPrefixSize+len(pkt1))
+	binary.BigEndian.PutUint16(sym1[:2], uint16(len(pkt1)))
+	copy(sym1[2:], pkt1)
+
+	sym2 := make([]byte, LengthPrefixSize+len(pkt2))
+	binary.BigEndian.PutUint16(sym2[:2], uint16(len(pkt2)))
+	copy(sym2[2:], pkt2)
+
+	parityBData := make([]byte, len(sym2))
+	copy(parityBData, sym2)
+	XORBytes(parityBData, sym1, len(sym1))
+
+	parityB := ParityShard{
+		BaseSeq:  1,
+		Mask:     NewBitset256FromUint64(0b11), // seq 1 and seq 2
+		Data:     parityBData,
+		IsParity: true,
+	}
+
+	// Build Parity A = pkt0 ^ pkt1 (BaseSeq = 0, mask = 0b11 => seq 0 and seq 1)
+	sym0 := make([]byte, LengthPrefixSize+len(pkt0))
+	binary.BigEndian.PutUint16(sym0[:2], uint16(len(pkt0)))
+	copy(sym0[2:], pkt0)
+
+	parityAData := make([]byte, len(sym1))
+	copy(parityAData, sym1)
+	XORBytes(parityAData, sym0, len(sym0))
+
+	parityA := ParityShard{
+		BaseSeq:  0,
+		Mask:     NewBitset256FromUint64(0b11), // seq 0 and seq 1
+		Data:     parityAData,
+		IsParity: true,
+	}
+
+	// 1. Ingest Parity B (stored in pivot slot 1 with length 602)
+	_, err := dec.PushShard(parityB)
+	if err != nil {
+		t.Fatalf("PushShard(parityB) failed: %v", err)
+	}
+
+	// 2. Ingest Parity A (stored in pivot slot 0 with length 202)
+	_, err = dec.PushShard(parityA)
+	if err != nil {
+		t.Fatalf("PushShard(parityA) failed: %v", err)
+	}
+
+	// 3. Ingest Systematic 0 (length 52 bytes)
+	// This triggers Step 2: solves seq 0, generates carry-over for seq 1 (length 202).
+	// carry-over reduces against pivot 1 (length 602 > 202).
+	// Prior bug: carryOverBuf was sliced to [:202], causing slice bounds panic when copying [:602].
+	rec, err := dec.PushShard(SystematicShard{
+		BaseSeq:  0,
+		Mask:     NewBitset256FromUint64(1),
+		Data:     sym0,
+		IsParity: false,
+	})
+	if err != nil {
+		t.Fatalf("PushShard(sym0) failed: %v", err)
+	}
+
+	// Ingesting sym0 triggers a multi-level cascade through carryOverBuf:
+	// 1. Solves pkt0 (50B)
+	// 2. CarryOverBuf (len 202) expands and reduces against parityB (len 602), solving pkt2 (600B) without slice bound panic!
+	// 3. Solving pkt2 back-substitutes into older pivots, solving pkt1 (200B) as well!
+	if len(rec) != 3 {
+		t.Fatalf("expected all 3 packets recovered in cascade, got %d", len(rec))
+	}
+
+	foundPkt0 := false
+	foundPkt1 := false
+	foundPkt2 := false
+	for _, p := range rec {
+		if bytes.Equal(p, pkt0) {
+			foundPkt0 = true
+		}
+		if bytes.Equal(p, pkt1) {
+			foundPkt1 = true
+		}
+		if bytes.Equal(p, pkt2) {
+			foundPkt2 = true
+		}
+	}
+	if !foundPkt0 || !foundPkt1 || !foundPkt2 {
+		t.Fatalf("cascade failed to recover all variable-sized packets: found0=%v, found1=%v, found2=%v",
+			foundPkt0, foundPkt1, foundPkt2)
+	}
+
+	// Ingesting sym1 now should be detected as redundant since pkt1 was already solved in the cascade
+	rec2, err := dec.PushShard(SystematicShard{
+		BaseSeq:  1,
+		Mask:     NewBitset256FromUint64(1),
+		Data:     sym1,
+		IsParity: false,
+	})
+	if err != nil {
+		t.Fatalf("PushShard(sym1) failed: %v", err)
+	}
+	if len(rec2) != 0 {
+		t.Fatalf("expected redundant shard to return 0 recovered packets, got %d", len(rec2))
+	}
+}
+
+// 22. Test InOrderResequencer ZeroCopy vs Safe ownership semantics
+func TestInOrderResequencer_ZeroCopyVsSafeOwnership(t *testing.T) {
+	// 1. Safe mode (default): emitted slices survive pool recycling
+	var capturedSafe [][]byte
+	reseqSafe := NewInOrderResequencer(50*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		capturedSafe = append(capturedSafe, pkt)
+	})
+
+	pkt1 := []byte("packet-1-out-of-order-data")
+	pkt0 := []byte("packet-0-in-order-data")
+
+	reseqSafe.Push(1, pkt1) // Out of order: buffered in packetBufferPool
+	reseqSafe.Push(0, pkt0) // Fast-path: drains 0 and 1
+
+	if len(capturedSafe) != 2 {
+		t.Fatalf("expected 2 packets, got %d", len(capturedSafe))
+	}
+
+	// Mutate pool buffers by claiming new ones from pool and overwriting with garbage
+	buf := GetPacketBuffer()
+	copy(buf, bytes.Repeat([]byte{0xFF}, len(pkt1)))
+	PutPacketBuffer(buf)
+
+	// In safe mode, capturedSafe[1] MUST remain completely intact
+	if !bytes.Equal(capturedSafe[1], pkt1) {
+		t.Fatalf("safe mode violated: packet 1 was corrupted to %x", capturedSafe[1])
+	}
+	reseqSafe.Close()
+
+	// 2. ZeroCopy mode: verify ResequencerConfig constructor and proper delivery
+	var capturedZero [][]byte
+	reseqZero := NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:    50 * time.Millisecond,
+		MaxPending: 10,
+		ZeroCopy:   true,
+		OnEmit: func(seq uint64, pkt []byte) {
+			// In zero-copy mode, caller must clone if retaining beyond callback
+			cp := make([]byte, len(pkt))
+			copy(cp, pkt)
+			capturedZero = append(capturedZero, cp)
+		},
+	})
+	reseqZero.Push(1, pkt1)
+	reseqZero.Push(0, pkt0)
+	if len(capturedZero) != 2 || !bytes.Equal(capturedZero[1], pkt1) {
+		t.Fatalf("zero-copy mode delivery failed")
+	}
+	reseqZero.Close()
+}
+
+// 23. Test IncrementalDecoder pivot eviction telemetry on ring wrap-around
+func TestIncrementalDecoder_PivotEvictionTelemetry(t *testing.T) {
+	// Decoder with small capacity of 4 slots
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 4, SymbolSize: 100})
+
+	if dec.PivotsEvicted() != 0 {
+		t.Fatalf("expected 0 evicted pivots initially")
+	}
+
+	payload := make([]byte, LengthPrefixSize+10)
+	binary.BigEndian.PutUint16(payload[:2], 10)
+
+	// Push 4 innovative parity shards that occupy all 4 slots (seq 0, 1, 2, 3)
+	// Each mask has 2 bits so they remain active, unsolved pivots
+	for i := uint64(0); i < 4; i++ {
+		_, err := dec.PushShard(ParityShard{
+			BaseSeq:  i,
+			Mask:     NewBitset256FromUint64(0b11),
+			Data:     payload,
+			IsParity: true,
+		})
+		if err != nil {
+			t.Fatalf("PushShard failed: %v", err)
+		}
+	}
+
+	if dec.PivotsEvicted() != 0 {
+		t.Fatalf("expected 0 evictions before ring wrap-around")
+	}
+
+	// Now push parity shard with BaseSeq = 4 (wraps around to slot 4 % 4 == 0)
+	// Slot 0 holds an active, unsolved pivot (seq 0 != 4), so it must be evicted!
+	_, err := dec.PushShard(ParityShard{
+		BaseSeq:  4,
+		Mask:     NewBitset256FromUint64(0b11),
+		Data:     payload,
+		IsParity: true,
+	})
+	if err != nil {
+		t.Fatalf("PushShard wrap-around failed: %v", err)
+	}
+
+	if dec.PivotsEvicted() == 0 {
+		t.Fatalf("expected PivotsEvicted > 0 after ring collision wrap-around, got %d", dec.PivotsEvicted())
+	}
+
+	// Reset resets eviction counter
+	dec.Reset()
+	if dec.PivotsEvicted() != 0 {
+		t.Fatalf("expected PivotsEvicted to reset to 0, got %d", dec.PivotsEvicted())
+	}
+}
+
+// 24. Test CRC32-Castagnoli integrity check in Shard wire format and encoder
+func TestShard_CRC32CastagnoliIntegrity(t *testing.T) {
+	payload := []byte("hello rlnc hardware accelerated crc32-c integrity")
+
+	// 1. Compact header round-trip with Checksum: true
+	shardCompact := Shard{
+		BaseSeq:  42,
+		Mask:     NewBitset256FromUint64(0b101),
+		Data:     payload,
+		IsParity: true,
+		Checksum: true,
+	}
+
+	wireBuf := make([]byte, shardCompact.TotalWireSize())
+	n, err := shardCompact.EncodeTo(wireBuf)
+	if err != nil {
+		t.Fatalf("EncodeTo failed: %v", err)
+	}
+
+	// Verify FlagChecksum (0x04) is present
+	flags := wireBuf[18]
+	if (flags & FlagChecksum) == 0 {
+		t.Fatalf("expected FlagChecksum (0x04) set in flags, got 0x%02x", flags)
+	}
+
+	decoded, err := DecodeShard(wireBuf[:n])
+	if err != nil {
+		t.Fatalf("DecodeShard failed: %v", err)
+	}
+	if !decoded.Checksum || !bytes.Equal(decoded.Data, payload) || decoded.BaseSeq != 42 {
+		t.Fatalf("decoded shard corrupted: %+v", decoded)
+	}
+
+	// 2. Tampering test: corrupt 1 bit in payload
+	wireTampered := make([]byte, n)
+	copy(wireTampered, wireBuf[:n])
+	wireTampered[CompactHeaderSize+5] ^= 0x01 // Flip 1 bit in payload
+
+	_, err = DecodeShard(wireTampered)
+	if err != ErrChecksumMismatch {
+		t.Fatalf("expected ErrChecksumMismatch on tampered payload, got: %v", err)
+	}
+
+	// Corrupt 1 bit in BaseSeq
+	copy(wireTampered, wireBuf[:n])
+	wireTampered[2] ^= 0x01
+	_, err = DecodeShard(wireTampered)
+	if err != ErrChecksumMismatch {
+		t.Fatalf("expected ErrChecksumMismatch on tampered BaseSeq, got: %v", err)
+	}
+
+	// Corrupt 1 bit in Mask
+	copy(wireTampered, wireBuf[:n])
+	wireTampered[10] ^= 0x01
+	_, err = DecodeShard(wireTampered)
+	if err != ErrChecksumMismatch {
+		t.Fatalf("expected ErrChecksumMismatch on tampered Mask, got: %v", err)
+	}
+
+	// 3. Extended header with Checksum
+	shardExtended := Shard{
+		BaseSeq:  100,
+		Mask:     Bitset256{1, 2, 3, 4},
+		Data:     payload,
+		IsParity: true,
+		Checksum: true,
+	}
+	extBuf := make([]byte, shardExtended.TotalWireSize())
+	extN, err := shardExtended.EncodeTo(extBuf)
+	if err != nil {
+		t.Fatalf("EncodeTo extended failed: %v", err)
+	}
+	decodedExt, err := DecodeShard(extBuf[:extN])
+	if err != nil {
+		t.Fatalf("DecodeShard extended failed: %v", err)
+	}
+	if !decodedExt.Checksum || decodedExt.Mask != shardExtended.Mask {
+		t.Fatalf("extended shard mismatch")
+	}
+
+	// Corrupt extended mask (bytes 24..48)
+	extTampered := make([]byte, extN)
+	copy(extTampered, extBuf[:extN])
+	extTampered[35] ^= 0x80
+	_, err = DecodeShard(extTampered)
+	if err != ErrChecksumMismatch {
+		t.Fatalf("expected ErrChecksumMismatch on tampered extended mask, got: %v", err)
+	}
+
+	// 4. EncoderConfig Checksum: true
+	enc := NewSlidingEncoder(EncoderConfig{
+		WindowSize: 4,
+		SymbolSize: 100,
+		Checksum:   true,
+	})
+	sShard, err := enc.Push([]byte("test-data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sShard.Checksum {
+		t.Fatalf("expected encoder to produce shards with Checksum: true")
+	}
+
+	wireEnc := make([]byte, sShard.TotalWireSize())
+	encN, err := sShard.EncodeTo(wireEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decShard, err := DecodeShard(wireEnc[:encN])
+	if err != nil {
+		t.Fatalf("DecodeShard from encoder failed: %v", err)
+	}
+	if !decShard.Checksum {
+		t.Fatalf("expected decoded shard to have Checksum: true")
+	}
+
+	// 5. Backward compatibility: Checksum: false decodes normally
+	shardNoCRC := Shard{
+		BaseSeq:  1,
+		Mask:     NewBitset256FromUint64(1),
+		Data:     payload,
+		Checksum: false,
+	}
+	noCRCBuf := make([]byte, shardNoCRC.TotalWireSize())
+	nNoCRC, err := shardNoCRC.EncodeTo(noCRCBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decNoCRC, err := DecodeShard(noCRCBuf[:nNoCRC])
+	if err != nil {
+		t.Fatalf("expected legacy shard to decode cleanly, got: %v", err)
+	}
+	if decNoCRC.Checksum {
+		t.Fatalf("expected decNoCRC.Checksum == false")
+	}
+}
+
 
 
 

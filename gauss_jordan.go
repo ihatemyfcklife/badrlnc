@@ -85,6 +85,10 @@ func (d *IncrementalDecoder) processShardLocked(shard Shard) {
 			hasCarryOver = true
 		}
 
+		if p.active && !p.solved && p.seq != targetSeq {
+			d.pivotsEvicted.Add(1)
+		}
+
 		p.active = false
 		p.solved = true
 		p.seq = targetSeq
@@ -93,7 +97,8 @@ func (d *IncrementalDecoder) processShardLocked(shard Shard) {
 		d.backSubstituteSolvedSeq(targetSeq)
 
 		if hasCarryOver {
-			d.reduceAndInsert(targetSeq, carryOverMask, d.carryOverBuf[:carryOverLen], carryOverLen)
+			ClearBytes(d.carryOverBuf[carryOverLen:])
+			d.reduceAndInsert(targetSeq, carryOverMask, d.carryOverBuf, carryOverLen)
 		}
 		return
 	}
@@ -213,6 +218,9 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 
 		// Found empty pivot slot at curSeq
 		p = &d.pivots[curSeq%uint64(d.capacity)]
+		if p.active && !p.solved && p.seq != curSeq {
+			d.pivotsEvicted.Add(1)
+		}
 		p.seq = curSeq
 		p.mask = curMask
 		p.len = payloadLen
