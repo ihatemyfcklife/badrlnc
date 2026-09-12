@@ -103,6 +103,12 @@ func main() {
 	}
 	fmt.Printf("Emitted Parity Shard: BaseSeq=%d, Mask=%s\n", parityShard.BaseSeq, parityShard.Mask)
 
+	// 3. Flush tail parities when pausing/ending a burst (ignores InactivityTimeout)
+	tailParity, err := encoder.FlushParity()
+	if err == nil {
+		fmt.Printf("Emitted Burst Tail Parity: BaseSeq=%d, Mask=%s\n", tailParity.BaseSeq, tailParity.Mask)
+	}
+
 	// Mode B: Zero-Copy Fast-Path (0 allocs/op):
 	// Set ZeroCopy: true in EncoderConfig. Shards point directly to internal encoder buffers.
 }
@@ -144,6 +150,11 @@ func main() {
 		// Safe to retain, queue, or send across goroutines indefinitely
 		fmt.Printf("Recovered Packet: %s\n", string(pkt))
 	}
+
+	// Concurrency Architecture Note:
+	// In multi-worker architectures using ZeroCopy: true, dedicate 1 IncrementalDecoder
+	// per stream/worker (thread-per-stream pattern) to eliminate lock contention and avoid
+	// slice overwrites while OnDecoded runs. Safe Mode (ZeroCopy: false) is free of this constraint.
 }
 ```
 
@@ -246,6 +257,12 @@ go test -v -run TestMatrixInversion .
 Run benchmarks and memory allocation profiling:
 ```bash
 go test -bench="." -benchmem
+```
+
+Run fuzzing security tests:
+```bash
+go test -fuzz=FuzzDecodeShard -fuzztime=30s .
+go test -fuzz=FuzzDecoderPushRawShard -fuzztime=30s .
 ```
 
 ---

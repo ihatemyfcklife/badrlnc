@@ -1,6 +1,7 @@
 package rlnc
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
@@ -19,10 +20,15 @@ type EncoderConfig struct {
 
 	// InactivityTimeout is the maximum duration a packet remains eligible for parity combinations.
 	// Packets older than this duration are automatically evicted to avoid stale combinations.
-	// Set to 0 to disable inactivity eviction. Default is 150ms.
+	// When left 0, it defaults to 150ms. Set to < 0 or set DisableInactivityTimeout: true to disable.
 	InactivityTimeout time.Duration
 
+	// DisableInactivityTimeout explicitly disables inactivity packet eviction, allowing packets
+	// in the sliding window to remain eligible indefinitely until evicted by window size overflow.
+	DisableInactivityTimeout bool
+
 	// Seed is an optional initial seed for the SplitMix64 PRNG generating parity coefficients.
+	// When 0 (default), a cryptographically secure random 64-bit seed is automatically generated.
 	Seed uint64
 
 	// ZeroCopy specifies whether emitted Shards reuse internal encoder buffers.
@@ -78,14 +84,24 @@ func NewSlidingEncoder(cfg EncoderConfig) *SlidingWindowEncoder {
 		symbolSize = DefaultSymbolSize
 	}
 
-	inactivityTimeout := cfg.InactivityTimeout
-	if inactivityTimeout <= 0 && cfg.InactivityTimeout == 0 {
+	var inactivityTimeout time.Duration
+	if cfg.DisableInactivityTimeout || cfg.InactivityTimeout < 0 {
+		inactivityTimeout = 0
+	} else if cfg.InactivityTimeout == 0 {
 		inactivityTimeout = 150 * time.Millisecond
+	} else {
+		inactivityTimeout = cfg.InactivityTimeout
 	}
 
 	seed := cfg.Seed
 	if seed == 0 {
-		seed = 0xdeadbeefcafe1337
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err == nil {
+			seed = binary.BigEndian.Uint64(b[:])
+		}
+		if seed == 0 {
+			seed = uint64(time.Now().UnixNano())
+		}
 	}
 
 	internalSymbolCapacity := LengthPrefixSize + symbolSize
@@ -181,10 +197,24 @@ func (e *SlidingWindowEncoder) Push(payload []byte) (SystematicShard, error) {
 //   - Default (ZeroCopy: false): ParityShard.Data is a freshly allocated clone owned by the caller.
 //   - ZeroCopy (ZeroCopy: true): ParityShard.Data points directly to the encoder's internal scratch buffer
 //     (strictly 0 heap allocations). Callers must clone or serialize before subsequent calls.
+// If the window has been idle longer than InactivityTimeout, ErrZeroPayload is returned.
 func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.generateParityLocked(false)
+}
 
+// FlushParity produces an innovative GF(2) linear combination across all remaining valid packets
+// in the sliding window, explicitly ignoring InactivityTimeout.
+// This is critical for protecting the tail packets of a transmission burst before entering idle state.
+// Memory Ownership follows the configured ZeroCopy setting identical to GenerateParity.
+func (e *SlidingWindowEncoder) FlushParity() (ParityShard, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.generateParityLocked(true)
+}
+
+func (e *SlidingWindowEncoder) generateParityLocked(ignoreInactivity bool) (ParityShard, error) {
 	if e.nextSeq == 0 {
 		return ParityShard{}, ErrZeroPayload
 	}
@@ -192,7 +222,7 @@ func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 	now := time.Now()
 
 	// If no packet was pushed within inactivityTimeout, the window is idle
-	if e.inactivityTimeout > 0 && !e.lastPushTime.IsZero() && now.Sub(e.lastPushTime) > e.inactivityTimeout {
+	if !ignoreInactivity && e.inactivityTimeout > 0 && !e.lastPushTime.IsZero() && now.Sub(e.lastPushTime) > e.inactivityTimeout {
 		return ParityShard{}, ErrZeroPayload
 	}
 
@@ -206,10 +236,18 @@ func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 	latestSeq := e.nextSeq - 1
 
 	// Advance minSeq to ignore stale packets older than inactivityTimeout
-	if e.inactivityTimeout > 0 {
+	if !ignoreInactivity && e.inactivityTimeout > 0 {
 		for minSeq < latestSeq {
 			idx := int(minSeq % uint64(e.windowSize))
 			if e.entries[idx].valid && now.Sub(e.entries[idx].timestamp) <= e.inactivityTimeout {
+				break
+			}
+			minSeq++
+		}
+	} else {
+		for minSeq < latestSeq {
+			idx := int(minSeq % uint64(e.windowSize))
+			if e.entries[idx].valid && e.entries[idx].seq == minSeq {
 				break
 			}
 			minSeq++

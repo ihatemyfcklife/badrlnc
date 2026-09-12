@@ -308,9 +308,16 @@ func (d *IncrementalDecoder) recordAndEmitSolved(seq uint64, data []byte) {
 
 	recoveredPayload := rec.data[LengthPrefixSize:totalRecordLen]
 	if d.onDecoded != nil {
+		emitPayload := recoveredPayload
+		if !d.zeroCopy {
+			// In safe mode, clone payload so callbacks receive independent memory allocations
+			cp := make([]byte, pktLen)
+			copy(cp, recoveredPayload)
+			emitPayload = cp
+		}
 		d.pendingEmit = append(d.pendingEmit, decodedItem{
 			seq: seq,
-			pkt: recoveredPayload,
+			pkt: emitPayload,
 		})
 	}
 

@@ -25,16 +25,19 @@ type DecoderConfig struct {
 	// Behavior & Concurrency:
 	//   - ZeroCopy: false (default): Recovered packets and the outer slice are safely cloned
 	//     into fresh heap allocations and returned from PushShard. Fully safe for concurrent
-	//     use across goroutines.
+	//     use across arbitrary goroutines without restrictions.
 	//   - ZeroCopy: true: Recovered packets are streamed directly to OnDecoded without
 	//     allocating slices. PushShard returns (nil, nil) with strictly 0 heap allocations.
-	//     Concurrency note: Callbacks are intentionally executed outside the mutex lock to eliminate
-	//     lock contention and allow re-entrant decoder operations. In ZeroCopy mode, packet slices
-	//     point directly to internal circular buffers and are only valid for the duration of the
-	//     callback invocation. If multiple goroutines push shards concurrently to the SAME decoder instance,
-	//     external synchronization is recommended to avoid circular ring buffer aliasing on wrap-around.
-	//     In high-throughput multi-worker architectures, dedicating one IncrementalDecoder per
-	//     network stream/worker is the recommended pattern.
+	//
+	// CRITICAL CONCURRENCY CONTRACT (ZeroCopy: true):
+	// Callbacks are intentionally executed outside the mutex lock to eliminate lock contention
+	// and allow re-entrant decoder operations. In ZeroCopy mode, packet slices point directly to
+	// internal circular buffers (solvedRing) and are valid strictly during callback execution.
+	// If multiple goroutines push shards to the SAME decoder instance concurrently in ZeroCopy mode,
+	// external synchronization (e.g. an external mutex wrapping PushShard calls) is MANDATORY to
+	// prevent a concurrent worker from overwriting the ring slot while OnDecoded is executing.
+	// In production multi-worker architectures, dedicating one IncrementalDecoder per network
+	// stream/connection (thread-per-stream pattern) or using ZeroCopy: false is the required pattern.
 	ZeroCopy bool
 
 	// OnDecoded is invoked immediately when a source packet is recovered.

@@ -34,6 +34,21 @@ type ResequencerConfig struct {
 	// Set to true only if your higher layer explicitly tolerates or expects out-of-order retrograde packets.
 	AllowLateDelivery bool
 
+	// BackwardJumpThreshold specifies the minimum sequence drop (expectedSeq - seq) that triggers
+	// an automatic session reset (default 10,000 packets). If set <= 0, defaults to 10,000.
+	BackwardJumpThreshold int64
+
+	// MaxConsecutiveStale specifies the number of consecutive retrograde packets (seq < expectedSeq)
+	// received before triggering an automatic session reset (default 64 packets).
+	// This recovers streams where the remote peer restarted at a sequence near expectedSeq without a huge jump.
+	// If set <= 0, defaults to 64.
+	MaxConsecutiveStale uint64
+
+	// InitialSeq specifies an optional explicit starting sequence number.
+	// When set, the resequencer synchronizes immediately to this sequence number without
+	// waiting or applying heuristics. If nil (default), standard stream synchronization is used.
+	InitialSeq *uint64
+
 	// OnEmit is invoked with the packet and its sequence number strictly in order.
 	OnEmit func(seq uint64, packet []byte)
 }
@@ -49,19 +64,23 @@ type pendingPacket struct {
 // it completely eliminates TCP Duplicate ACKs and prevents congestion window collapse.
 // It is safe for concurrent use.
 type InOrderResequencer struct {
-	mu                sync.Mutex
-	maxWait           time.Duration
-	maxPending        int
-	zeroCopy          bool
-	allowLateDelivery bool
-	expectedSeq       uint64
-	initialized       bool
-	pending           map[uint64]pendingPacket
-	emittedRing       [2048]uint64
-	timer             *time.Timer
-	onEmit            func(seq uint64, packet []byte)
-	isClosed          bool
-	pendingEmit       []reseqItem
+	mu                    sync.Mutex
+	maxWait               time.Duration
+	maxPending            int
+	zeroCopy              bool
+	allowLateDelivery     bool
+	backwardJumpThreshold int64
+	maxConsecutiveStale   uint64
+	expectedSeq           uint64
+	initialized           bool
+	pending               map[uint64]pendingPacket
+	emittedRing           [2048]uint64
+	timer                 *time.Timer
+	timerEpoch            uint64
+	consecutiveStale      uint64
+	onEmit                func(seq uint64, packet []byte)
+	isClosed              bool
+	pendingEmit           []reseqItem
 
 	// Telemetry
 	delivered    uint64
@@ -80,15 +99,29 @@ func NewInOrderResequencerWithConfig(cfg ResequencerConfig) *InOrderResequencer 
 	if maxPending <= 0 {
 		maxPending = 1024
 	}
+	backwardJumpThreshold := cfg.BackwardJumpThreshold
+	if backwardJumpThreshold <= 0 {
+		backwardJumpThreshold = 10000
+	}
+	maxConsecutiveStale := cfg.MaxConsecutiveStale
+	if maxConsecutiveStale == 0 {
+		maxConsecutiveStale = 64
+	}
 
 	r := &InOrderResequencer{
-		maxWait:           maxWait,
-		maxPending:        maxPending,
-		zeroCopy:          cfg.ZeroCopy,
-		allowLateDelivery: cfg.AllowLateDelivery,
-		pending:           make(map[uint64]pendingPacket),
-		onEmit:            cfg.OnEmit,
-		pendingEmit:       make([]reseqItem, 0, 16),
+		maxWait:               maxWait,
+		maxPending:            maxPending,
+		zeroCopy:              cfg.ZeroCopy,
+		allowLateDelivery:     cfg.AllowLateDelivery,
+		backwardJumpThreshold: backwardJumpThreshold,
+		maxConsecutiveStale:   maxConsecutiveStale,
+		pending:               make(map[uint64]pendingPacket),
+		onEmit:                cfg.OnEmit,
+		pendingEmit:           make([]reseqItem, 0, 16),
+	}
+	if cfg.InitialSeq != nil {
+		r.expectedSeq = *cfg.InitialSeq
+		r.initialized = true
 	}
 	for i := range r.emittedRing {
 		r.emittedRing[i] = ^uint64(0)
@@ -140,10 +173,12 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 	if diff > 100000 {
 		r.drainAllPendingLocked()
 		r.expectedSeq = seq
+		r.consecutiveStale = 0
 		diff = 0
 	}
 
 	if diff == 0 {
+		r.consecutiveStale = 0
 		// Zero-delay fast-path: packet is strictly in order.
 		r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
 		r.emittedRing[seq%2048] = seq
@@ -151,10 +186,24 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 		r.delivered++
 		r.drainConsecutiveLocked()
 	} else if diff < 0 {
-		// Late packet arriving after a gap was already skipped (seq < expectedSeq).
-		// By default (AllowLateDelivery: false), retrograde packets are discarded to guarantee
-		// strictly monotonic in-order delivery without TCP duplicate ACKs or congestion window collapse.
-		if r.allowLateDelivery && diff > -1024 && r.emittedRing[seq%2048] != seq {
+		r.consecutiveStale++
+
+		// Detect remote session reset on backward discontinuity:
+		// 1. If massive backward drop (diff <= -backwardJumpThreshold), reset after 3 consecutive retrograde packets
+		//    to avoid false positives from isolated ghost or replayed packets.
+		// 2. Otherwise, reset after maxConsecutiveStale packets.
+		isRetrogradeReset := (r.backwardJumpThreshold > 0 && diff <= -r.backwardJumpThreshold && r.consecutiveStale >= 3) ||
+			(r.maxConsecutiveStale > 0 && r.consecutiveStale >= r.maxConsecutiveStale)
+
+		if isRetrogradeReset {
+			r.drainAllPendingLocked()
+			r.expectedSeq = seq + 1
+			r.consecutiveStale = 0
+			r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
+			r.emittedRing[seq%2048] = seq
+			r.delivered++
+			r.drainConsecutiveLocked()
+		} else if r.allowLateDelivery && diff > -1024 && r.emittedRing[seq%2048] != seq {
 			r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
 			r.emittedRing[seq%2048] = seq
 			r.delivered++
@@ -162,6 +211,7 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 			r.stalePackets++
 		}
 	} else {
+		r.consecutiveStale = 0
 		// diff > 0: future packet arrived out of order.
 		if _, exists := r.pending[seq]; !exists {
 			var buf []byte
@@ -185,7 +235,11 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 				r.skipToLowestPendingLocked()
 			} else if r.timer == nil {
 				// Ensure timeout timer is running
-				r.timer = time.AfterFunc(r.maxWait, r.onTimeout)
+				r.timerEpoch++
+				epoch := r.timerEpoch
+				r.timer = time.AfterFunc(r.maxWait, func() {
+					r.onTimeout(epoch)
+				})
 			}
 		}
 	}
@@ -222,13 +276,16 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 	}
 }
 
-func (r *InOrderResequencer) onTimeout() {
+func (r *InOrderResequencer) onTimeout(epoch uint64) {
 	r.mu.Lock()
-	if r.isClosed || len(r.pending) == 0 {
-		r.timer = nil
+	if r.isClosed || r.timerEpoch != epoch || len(r.pending) == 0 {
+		if r.timerEpoch == epoch {
+			r.timer = nil
+		}
 		r.mu.Unlock()
 		return
 	}
+	r.timer = nil
 
 	r.pendingEmit = r.pendingEmit[:0]
 	r.gapsSkipped++
@@ -279,17 +336,11 @@ func (r *InOrderResequencer) skipToLowestPendingLocked() {
 	if found {
 		r.expectedSeq = minSeq
 		r.drainConsecutiveLocked()
-	}
-
-	if len(r.pending) > 0 && !r.isClosed {
-		if r.timer != nil {
-			r.timer.Stop()
-		}
-		r.timer = time.AfterFunc(r.maxWait, r.onTimeout)
 	} else {
 		if r.timer != nil {
 			r.timer.Stop()
 			r.timer = nil
+			r.timerEpoch++
 		}
 	}
 }
@@ -311,9 +362,24 @@ func (r *InOrderResequencer) drainConsecutiveLocked() {
 		r.delivered++
 	}
 
-	if len(r.pending) == 0 && r.timer != nil {
-		r.timer.Stop()
-		r.timer = nil
+	if len(r.pending) == 0 {
+		if r.timer != nil {
+			r.timer.Stop()
+			r.timer = nil
+			r.timerEpoch++
+		}
+	} else if !r.isClosed {
+		// A gap was filled and expectedSeq advanced, but another gap remains ahead.
+		// Reset the timer to give the new missing sequence the full maxWait duration,
+		// preventing premature skips caused by residual timer duration from the previous gap.
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+		r.timerEpoch++
+		epoch := r.timerEpoch
+		r.timer = time.AfterFunc(r.maxWait, func() {
+			r.onTimeout(epoch)
+		})
 	}
 }
 
@@ -321,6 +387,7 @@ func (r *InOrderResequencer) drainAllPendingLocked() {
 	if r.timer != nil {
 		r.timer.Stop()
 		r.timer = nil
+		r.timerEpoch++
 	}
 	for len(r.pending) > 0 {
 		r.skipToLowestPendingLocked()
@@ -373,6 +440,7 @@ func (r *InOrderResequencer) Reset() {
 	if r.timer != nil {
 		r.timer.Stop()
 		r.timer = nil
+		r.timerEpoch++
 	}
 	for _, item := range r.pending {
 		if item.isPooled {
@@ -384,6 +452,7 @@ func (r *InOrderResequencer) Reset() {
 		r.emittedRing[i] = ^uint64(0)
 	}
 	r.expectedSeq = 0
+	r.consecutiveStale = 0
 	r.initialized = false
 	r.delivered = 0
 	r.reordered = 0

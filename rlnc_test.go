@@ -1374,7 +1374,324 @@ func TestDecoder_OversizedShardReturnsError(t *testing.T) {
 	}
 }
 
+// 29. Test that InOrderResequencer resets timer on sequential gaps to prevent premature skips
+func TestInOrderResequencer_SequentialGapsNoPrematureSkip(t *testing.T) {
+	var mu sync.Mutex
+	var delivered []uint64
 
+	reseq := NewInOrderResequencer(60*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, seq)
+	})
+	defer reseq.Close()
 
+	// Step 1: Push packet 2 (gap at 0 and 1). Timer for gap starts (60ms).
+	reseq.Push(2, []byte("pkt-2"))
+
+	// Step 2: At 40ms, packet 0 arrives. Gap at 0 is filled.
+	// expectedSeq advances to 1. Gap at 1 is now the missing sequence.
+	// With the fix, the timer must be restarted for a full 60ms for packet 1.
+	time.Sleep(40 * time.Millisecond)
+	reseq.Push(0, []byte("pkt-0"))
+
+	// Step 3: Wait 35ms. Total time elapsed since start is 75ms (> original 60ms).
+	// Under the old bug, the timer would have fired at 60ms (20ms after pkt 0) and skipped pkt 1!
+	time.Sleep(35 * time.Millisecond)
+
+	// Step 4: Now push missing packet 1. It arrived 35ms after gap 1 became active (< 60ms).
+	// It MUST be delivered in-order and NOT marked as stale!
+	reseq.Push(1, []byte("pkt-1"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 3 {
+		t.Fatalf("expected 3 delivered packets, got %d: %v", len(delivered), delivered)
+	}
+	if delivered[0] != 0 || delivered[1] != 1 || delivered[2] != 2 {
+		t.Fatalf("expected [0, 1, 2], got %v", delivered)
+	}
+	if reseq.StalePackets() != 0 {
+		t.Fatalf("expected 0 stale packets, got %d", reseq.StalePackets())
+	}
+}
+
+// 30. Test that IncrementalDecoder clones packets for OnDecoded in safe mode (ZeroCopy: false)
+func TestDecoder_SafeMode_OnDecoded_MemoryIsolation(t *testing.T) {
+	var captured []byte
+	dec := NewIncrementalDecoder(DecoderConfig{
+		Capacity:   16,
+		SymbolSize: 100,
+		ZeroCopy:   false, // Safe mode
+		OnDecoded: func(seq uint64, pkt []byte) {
+			if seq == 0 {
+				captured = pkt // Retain slice directly
+			}
+		},
+	})
+
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 4, SymbolSize: 100})
+	s0, _ := enc.Push([]byte("immutable-packet-0"))
+	_, _ = dec.PushShard(s0)
+
+	if string(captured) != "immutable-packet-0" {
+		t.Fatalf("unexpected initial packet: %q", captured)
+	}
+
+	// Ingest enough packets to wrap around ring buffer slot 0 (capacity 16) multiple times
+	for i := 1; i <= 32; i++ {
+		s, _ := enc.Push([]byte("overwriting-garbage-data"))
+		_, _ = dec.PushShard(s)
+	}
+
+	// In safe mode, captured slice MUST NOT have been mutated by subsequent ring writes
+	if string(captured) != "immutable-packet-0" {
+		t.Fatalf("safe mode memory isolation violated! captured packet corrupted to %q", captured)
+	}
+}
+
+// 31. Test that SlidingWindowEncoder generates cryptographically random seeds by default
+func TestEncoder_CryptographicSeedDefault(t *testing.T) {
+	enc1 := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 100})
+	enc2 := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 100})
+
+	for i := 0; i < 8; i++ {
+		_, _ = enc1.Push([]byte("packet"))
+		_, _ = enc2.Push([]byte("packet"))
+	}
+
+	p1, err1 := enc1.GenerateParity()
+	p2, err2 := enc2.GenerateParity()
+	if err1 != nil || err2 != nil {
+		t.Fatalf("parity generation failed: %v, %v", err1, err2)
+	}
+
+	if p1.Mask == p2.Mask {
+		t.Fatalf("independent encoders produced identical parity masks! Seed is likely static: %s", p1.Mask)
+	}
+}
+
+// 32. Test that DisableInactivityTimeout allows parity generation across idle windows
+func TestEncoder_DisableInactivityTimeout(t *testing.T) {
+	enc := NewSlidingEncoder(EncoderConfig{
+		WindowSize:               16,
+		SymbolSize:               100,
+		DisableInactivityTimeout: true,
+	})
+
+	_, err := enc.Push([]byte("idle-packet"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait 200ms (> 150ms default inactivity timeout)
+	time.Sleep(200 * time.Millisecond)
+
+	// Parity generation MUST succeed because inactivity timeout was disabled
+	p, err := enc.GenerateParity()
+	if err != nil {
+		t.Fatalf("expected parity generation to succeed when inactivity timeout disabled, got: %v", err)
+	}
+	if p.Mask.IsZero() {
+		t.Fatal("expected non-zero parity mask")
+	}
+}
+
+// 33. Test InOrderResequencer InitialSeq explicit configuration
+func TestInOrderResequencer_InitialSeqConfig(t *testing.T) {
+	var delivered []uint64
+	initSeq := uint64(500)
+
+	reseq := NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:    50 * time.Millisecond,
+		MaxPending: 10,
+		InitialSeq: &initSeq,
+		OnEmit: func(seq uint64, pkt []byte) {
+			delivered = append(delivered, seq)
+		},
+	})
+	defer reseq.Close()
+
+	// Packet 500 should be delivered immediately on 0-delay fast path
+	reseq.Push(500, []byte("pkt-500"))
+
+	if len(delivered) != 1 || delivered[0] != 500 {
+		t.Fatalf("expected packet 500 delivered immediately with InitialSeq=500, got: %v", delivered)
+	}
+}
+
+// 34. Test InOrderResequencer timer race condition (timerEpoch guards against ghost timeout skips)
+func TestResequencer_TimerRace(t *testing.T) {
+	var mu sync.Mutex
+	var delivered []uint64
+	var skips uint64
+
+	reseq := NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:    30 * time.Millisecond,
+		MaxPending: 50,
+		OnEmit: func(seq uint64, pkt []byte) {
+			mu.Lock()
+			defer mu.Unlock()
+			delivered = append(delivered, seq)
+		},
+	})
+	defer reseq.Close()
+
+	// Push packet 0 (fast path)
+	reseq.Push(0, []byte("pkt-0"))
+
+	// Create a gap: Push packet 2 (waiting for packet 1, timer starts)
+	reseq.Push(2, []byte("pkt-2"))
+
+	// Wait 25ms (almost expired, runtime may schedule timer soon)
+	time.Sleep(25 * time.Millisecond)
+
+	// Packet 1 arrives just in time! Fills the gap and expectedSeq advances to 3.
+	// This also stops/reschedules the timer with timerEpoch++.
+	reseq.Push(1, []byte("pkt-1"))
+
+	// Push packet 4 (new gap waiting for packet 3).
+	// An un-guarded implementation might have a ghost onTimeout from gap 1 fire here
+	// and prematurely skip packet 3 with 0ms delay!
+	reseq.Push(4, []byte("pkt-4"))
+
+	// Wait 10ms (< 30ms maxWait). Packet 3 must NOT be skipped prematurely!
+	time.Sleep(10 * time.Millisecond)
+
+	mu.Lock()
+	delivCount := len(delivered)
+	mu.Unlock()
+
+	_, _, skips, _ = reseq.Stats()
+	if skips > 0 {
+		t.Fatalf("premature gap skip detected due to timer race! skips=%d", skips)
+	}
+	if delivCount != 3 {
+		t.Fatalf("expected 3 delivered packets (0, 1, 2), got %d: %v", delivCount, delivered)
+	}
+
+	// Now wait until the full 30ms maxWait expires for gap 3
+	time.Sleep(30 * time.Millisecond)
+
+	_, _, skips, _ = reseq.Stats()
+	if skips != 1 {
+		t.Fatalf("expected 1 gap skip after full timeout expired, got %d", skips)
+	}
+
+	mu.Lock()
+	if len(delivered) != 4 || delivered[3] != 4 {
+		t.Fatalf("expected packet 4 delivered after gap skip, got %v", delivered)
+	}
+	mu.Unlock()
+}
+
+// 35. Test InOrderResequencer session reset recovery on remote sender crash/restart
+func TestResequencer_SessionReset(t *testing.T) {
+	var delivered []uint64
+	reseq := NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:             20 * time.Millisecond,
+		MaxPending:          64,
+		MaxConsecutiveStale: 10,
+		OnEmit: func(seq uint64, pkt []byte) {
+			delivered = append(delivered, seq)
+		},
+	})
+	defer reseq.Close()
+
+	// Stream established: sender sends packets 0..50
+	for i := uint64(0); i <= 50; i++ {
+		reseq.Push(i, []byte{byte(i)})
+	}
+	if len(delivered) != 51 {
+		t.Fatalf("expected 51 delivered packets, got %d", len(delivered))
+	}
+
+	// Case A: Sender crashes and restarts at seq = 0 (diff <= -backwardJumpThreshold)
+	// Push 20,000 to advance expectedSeq to 20,001
+	reseq.Push(20000, []byte("pkt-20000"))
+	time.Sleep(30 * time.Millisecond) // gap skipped, expectedSeq becomes 20,001
+
+	delivered = delivered[:0]
+
+	// Remote restarted at seq = 0: first 2 packets are guarded against false-positive single ghost replay
+	reseq.Push(0, []byte("restart-0"))
+	reseq.Push(1, []byte("restart-1"))
+	if len(delivered) != 0 {
+		t.Fatalf("first 2 packets should be guarded as potential replayed ghosts, got: %v", delivered)
+	}
+
+	// 3rd consecutive packet confirms session restart!
+	reseq.Push(2, []byte("restart-2"))
+	if len(delivered) != 1 || delivered[0] != 2 {
+		t.Fatalf("expected session reset confirmed on 3rd packet, got: %v", delivered)
+	}
+
+	// Case B: Remote restarted at seq = 4800 (diff = -200, within backwardJumpThreshold)
+	// Consecutive stale packets threshold (MaxConsecutiveStale = 10) should trigger session reset
+	for i := uint64(3); i <= 5000; i++ {
+		reseq.Push(i, []byte("fast-forward"))
+	}
+
+	delivered = delivered[:0]
+	// Sender restarted at 4800. Expected is 5001.
+	// Send 9 retrograde packets (less than MaxConsecutiveStale = 10)
+	for i := uint64(0); i < 9; i++ {
+		reseq.Push(4800+i, []byte("retrograde"))
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("retrograde packets before threshold should be discarded, got: %v", delivered)
+	}
+
+	// 10th retrograde packet reaches MaxConsecutiveStale (10) -> triggers session reset!
+	reseq.Push(4809, []byte("retrograde-reset"))
+	if len(delivered) != 1 || delivered[0] != 4809 {
+		t.Fatalf("expected session reset on 10th consecutive retrograde packet, got: %v", delivered)
+	}
+
+	// Subsequent packets continue monotonically
+	reseq.Push(4810, []byte("packet-4810"))
+	if len(delivered) != 2 || delivered[1] != 4810 {
+		t.Fatalf("expected packet 4810 delivered in order, got: %v", delivered)
+	}
+}
+
+// 36. Test FlushParity ignores InactivityTimeout to protect burst tail
+func TestEncoder_FlushParityAfterInactivity(t *testing.T) {
+	enc := NewSlidingEncoder(EncoderConfig{
+		WindowSize:        16,
+		SymbolSize:        1400,
+		InactivityTimeout: 40 * time.Millisecond,
+	})
+
+	_, err := enc.Push([]byte("burst-packet-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = enc.Push([]byte("burst-packet-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait 60ms (> 40ms InactivityTimeout)
+	time.Sleep(60 * time.Millisecond)
+
+	// Standard GenerateParity must fail due to inactivity
+	_, err = enc.GenerateParity()
+	if err == nil {
+		t.Fatal("expected GenerateParity to fail after inactivity timeout, got nil")
+	}
+
+	// FlushParity MUST succeed by ignoring inactivity timeout, protecting the burst tail
+	tailParity, err := enc.FlushParity()
+	if err != nil {
+		t.Fatalf("expected FlushParity to succeed after inactivity timeout, got: %v", err)
+	}
+	if tailParity.Mask.IsZero() {
+		t.Fatal("expected non-zero mask for FlushParity shard")
+	}
+	if !tailParity.IsParity {
+		t.Fatal("expected IsParity to be true for FlushParity shard")
+	}
+}
 
 

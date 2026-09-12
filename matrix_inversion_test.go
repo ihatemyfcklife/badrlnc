@@ -12,7 +12,7 @@ import (
 // simulateLossTransmission simulates sending numPackets over an erasure channel
 // with lossPct packet loss and parityPct parity redundancy.
 func simulateLossTransmission(w int, parityPct int, lossPct float64, burstSize int, numPackets int, seed uint64) (sent, dropped, recovered int, allRecoveredMatch bool) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: w, SymbolSize: 1400, InactivityTimeout: 0})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: w, SymbolSize: 1400, DisableInactivityTimeout: true, Seed: seed})
 
 	var mu sync.Mutex
 	reconstructed := make(map[uint64][]byte)
@@ -235,7 +235,7 @@ func TestMatrixInversion_SimulatedLoss(t *testing.T) {
 // TestMatrixInversion_UnsolvableDegreesOfFreedom verifies that under-determined systems
 // (received symbols < source packets) strictly do not emit false packets.
 func TestMatrixInversion_UnsolvableDegreesOfFreedom(t *testing.T) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 16, SymbolSize: 1400})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 16, SymbolSize: 1400, Seed: 0xdeadbeefcafe1337})
 
 	var mu sync.Mutex
 	reconstructed := make(map[uint64][]byte)
