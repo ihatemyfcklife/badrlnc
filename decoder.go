@@ -44,7 +44,7 @@ type IncrementalDecoder struct {
 	zeroCopy   bool
 	onDecoded  func(seq uint64, packet []byte)
 
-	pivots           []PivotEntry
+	pivots           []pivotEntry
 	solvedRing       []solvedRecord
 	scratch          []byte
 	carryOverBuf     []byte
@@ -71,7 +71,7 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 
 	internalSymbolCapacity := LengthPrefixSize + symbolSize
 
-	pivots := make([]PivotEntry, capacity)
+	pivots := make([]pivotEntry, capacity)
 	solved := make([]solvedRecord, capacity)
 
 	for i := 0; i < capacity; i++ {

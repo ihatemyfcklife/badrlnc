@@ -5,8 +5,8 @@ import (
 	"math/bits"
 )
 
-// PivotEntry stores a single linear equation in Row Echelon Form over GF(2).
-type PivotEntry struct {
+// pivotEntry stores a single linear equation in Row Echelon Form over GF(2).
+type pivotEntry struct {
 	seq    uint64
 	mask   Bitset256
 	len    int
