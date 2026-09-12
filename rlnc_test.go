@@ -542,3 +542,57 @@ func TestLifecycleAndErrors(t *testing.T) {
 	}
 }
 
+// 13. Test ZeroCopy vs Safe mode slice aliasing semantics
+func TestDecoder_ZeroCopyVsSafe_Aliasing(t *testing.T) {
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 4, SymbolSize: 100})
+
+	pkt0 := []byte("packet-0-payload-alpha")
+	pkt1 := []byte("packet-1-payload-bravo")
+
+	s0, _ := enc.Push(pkt0)
+	s1, _ := enc.Push(pkt1)
+
+	// Safe mode (default): returned [][]byte is isolated and survives across subsequent calls
+	decSafe := NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100, ZeroCopy: false})
+	rec0Safe, err := decSafe.PushShard(s0)
+	if err != nil || len(rec0Safe) != 1 {
+		t.Fatalf("rec0Safe failed: %v", err)
+	}
+
+	rec1Safe, err := decSafe.PushShard(s1)
+	if err != nil || len(rec1Safe) != 1 {
+		t.Fatalf("rec1Safe failed: %v", err)
+	}
+
+	// In safe mode, rec0Safe must retain its original data intact
+	if !bytes.Equal(rec0Safe[0], pkt0) {
+		t.Fatalf("safe mode violated: rec0Safe corrupted to %q", rec0Safe[0])
+	}
+	if !bytes.Equal(rec1Safe[0], pkt1) {
+		t.Fatalf("safe mode violated: rec1Safe corrupted to %q", rec1Safe[0])
+	}
+
+	// Zero-copy mode with OnDecoded callback (recommended pattern)
+	var streamedPackets [][]byte
+	decZero := NewIncrementalDecoder(DecoderConfig{
+		Capacity:   16,
+		SymbolSize: 100,
+		ZeroCopy:   true,
+		OnDecoded: func(seq uint64, packet []byte) {
+			cp := make([]byte, len(packet))
+			copy(cp, packet)
+			streamedPackets = append(streamedPackets, cp)
+		},
+	})
+
+	_, _ = decZero.PushShard(s0)
+	_, _ = decZero.PushShard(s1)
+
+	if len(streamedPackets) != 2 {
+		t.Fatalf("expected 2 streamed packets via OnDecoded, got %d", len(streamedPackets))
+	}
+	if !bytes.Equal(streamedPackets[0], pkt0) || !bytes.Equal(streamedPackets[1], pkt1) {
+		t.Fatalf("streamed packet mismatch")
+	}
+}
+

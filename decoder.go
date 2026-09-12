@@ -21,12 +21,25 @@ type DecoderConfig struct {
 	InactivityTimeout time.Duration
 
 	// ZeroCopy enables zero-allocation packet delivery in PushShard.
-	// When true, slices in the returned [][]byte point directly to internal decoder ring buffers
-	// and are valid until overwritten by future PushShard calls.
-	// When false (default), returned packets are safely copied into freshly allocated slices.
+	//
+	// WARNING (Slice & Buffer Aliasing):
+	// When true, PushShard returns its internal scratch slice ([][]byte) whose elements point
+	// directly to internal decoder ring buffers (0 allocs/op).
+	// Crucially, BOTH the returned outer slice ([][]byte) AND its underlying memory are
+	// reset and overwritten on the very next call to PushShard.
+	//
+	// Recommended Alternatives:
+	//   1. For event-driven zero-copy streaming, configure OnDecoded(seq, packet) instead.
+	//      OnDecoded delivers packets immediately as they are solved without slice aliasing.
+	//   2. If using PushShard with ZeroCopy: true, process the returned [][]byte synchronously
+	//      before calling PushShard again, or make an explicit copy if retaining across calls.
+	//
+	// When false (default), each recovered packet and the outer slice are safely cloned into
+	// independent heap allocations.
 	ZeroCopy bool
 
 	// OnDecoded is an optional callback invoked immediately when a source packet is recovered.
+	// Recommended for high-performance streaming pipelines under ZeroCopy mode.
 	OnDecoded func(seq uint64, packet []byte)
 }
 
@@ -93,7 +106,16 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 // PushShard ingests a Shard (systematic or parity), incrementally reduces it via Gauss-Jordan
 // elimination over GF(2), cascades back-substitution into older pivots, and returns any packets
 // recovered during this step.
-// When DecoderConfig.ZeroCopy is true, the systematic fast-path achieves strictly 0 heap allocations.
+//
+// Memory Lifetime & ZeroCopy Semantics:
+//   - Default (ZeroCopy: false): Both the outer slice ([][]byte) and each packet ([]byte) are
+//     freshly allocated copies. Safe to store, queue, or retain indefinitely.
+//   - ZeroCopy (ZeroCopy: true): Strictly 0 heap allocations. The returned slice ([][]byte)
+//     is an internal reusable scratch buffer (d.recoveredScratch). Its backing array and elements
+//     are reset and overwritten on the very next call to PushShard.
+//     Do NOT retain the returned [][]byte slice across calls to PushShard!
+//     Instead, either process the returned packets synchronously within the same loop,
+//     or configure DecoderConfig.OnDecoded for idiomatic, event-driven zero-copy streaming.
 func (d *IncrementalDecoder) PushShard(shard Shard) (recovered [][]byte, err error) {
 	if len(shard.Data) == 0 {
 		return nil, ErrZeroPayload
