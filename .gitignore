@@ -1,0 +1,46 @@
+# Binaries for programs and tests
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Test and coverage artifacts
+*.out
+*.prof
+*.pprof
+cov
+cov_final.out
+coverage/
+coverage.html
+coverage.txt
+
+# Go workspace and build caches
+*.o
+*.a
+bin/
+dist/
+build/
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Temporary and log files
+*.log
+*.tmp
+*.temp

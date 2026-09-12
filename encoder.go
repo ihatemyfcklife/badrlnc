@@ -1,0 +1,324 @@
+package rlnc
+
+import (
+	"encoding/binary"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// EncoderConfig defines configuration parameters for SlidingWindowEncoder.
+type EncoderConfig struct {
+	// WindowSize specifies the maximum number of packets kept in the active encoding window (1..256).
+	// Default is DefaultWindowSize (32).
+	WindowSize int
+
+	// SymbolSize specifies the maximum raw payload size in bytes per packet.
+	// Default is DefaultSymbolSize (1400 bytes).
+	SymbolSize int
+
+	// InactivityTimeout is the maximum duration a packet remains eligible for parity combinations.
+	// Packets older than this duration are automatically evicted to avoid stale combinations.
+	// Set to 0 to disable inactivity eviction. Default is 150ms.
+	InactivityTimeout time.Duration
+
+	// Seed is an optional initial seed for the SplitMix64 PRNG generating parity coefficients.
+	Seed uint64
+}
+
+type encoderEntry struct {
+	seq       uint64
+	len       int
+	data      []byte
+	valid     bool
+	timestamp time.Time
+}
+
+// SlidingWindowEncoder maintains a continuous sliding window of W packets
+// and generates random linear network coding (RLNC) combinations over GF(2) at multi-gigabit wire speed.
+// It is fully safe for concurrent use.
+type SlidingWindowEncoder struct {
+	mu                sync.RWMutex
+	windowSize        int
+	symbolSize        int
+	inactivityTimeout time.Duration
+	entries           []encoderEntry
+	nextSeq           uint64
+	totalIn           atomic.Uint64
+	totalOut          atomic.Uint64
+	rngState          uint64
+	lastPushTime      time.Time
+	parityBuf         []byte
+}
+
+// NewSlidingEncoder initializes a SlidingWindowEncoder with the provided configuration.
+func NewSlidingEncoder(cfg EncoderConfig) *SlidingWindowEncoder {
+	windowSize := cfg.WindowSize
+	if windowSize <= 0 || windowSize > MaxExtendedWindowSize {
+		windowSize = DefaultWindowSize
+	}
+
+	symbolSize := cfg.SymbolSize
+	if symbolSize <= 0 {
+		symbolSize = DefaultSymbolSize
+	}
+
+	inactivityTimeout := cfg.InactivityTimeout
+	if inactivityTimeout <= 0 && cfg.InactivityTimeout == 0 {
+		inactivityTimeout = 150 * time.Millisecond
+	}
+
+	seed := cfg.Seed
+	if seed == 0 {
+		seed = 0xdeadbeefcafe1337
+	}
+
+	internalSymbolCapacity := LengthPrefixSize + symbolSize
+
+	entries := make([]encoderEntry, windowSize)
+	for i := 0; i < windowSize; i++ {
+		entries[i] = encoderEntry{
+			data: make([]byte, internalSymbolCapacity),
+		}
+	}
+
+	return &SlidingWindowEncoder{
+		windowSize:        windowSize,
+		symbolSize:        symbolSize,
+		inactivityTimeout: inactivityTimeout,
+		entries:           entries,
+		nextSeq:           0,
+		rngState:          seed,
+		parityBuf:         make([]byte, internalSymbolCapacity),
+	}
+}
+
+// nextRand returns a 64-bit pseudo-random number using SplitMix64 with 0 heap allocations.
+func (e *SlidingWindowEncoder) nextRand() uint64 {
+	e.rngState += 0x9e3779b97f4a7c15
+	z := e.rngState
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// Push ingests a raw payload into the sliding window and returns its corresponding SystematicShard.
+// Fast-path: strictly 0 heap allocations.
+// Note: SystematicShard.Data references the encoder's internal circular window entry for line-rate throughput.
+// If retaining or queueing shards across more than WindowSize subsequent pushes, use shard.Clone().
+func (e *SlidingWindowEncoder) Push(payload []byte) (SystematicShard, error) {
+	n := len(payload)
+	if n == 0 {
+		return SystematicShard{}, ErrZeroPayload
+	}
+	if n > e.symbolSize {
+		return SystematicShard{}, ErrPayloadTooLarge
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	seq := e.nextSeq
+	e.nextSeq++
+
+	idx := int(seq % uint64(e.windowSize))
+	entry := &e.entries[idx]
+
+	totalLen := LengthPrefixSize + n
+	binary.BigEndian.PutUint16(entry.data[0:LengthPrefixSize], uint16(n))
+	copy(entry.data[LengthPrefixSize:totalLen], payload)
+
+	// Zero out the remaining payload tail to ensure clean GF(2) XOR operations
+	if totalLen < len(entry.data) {
+		ClearBytes(entry.data[totalLen:])
+	}
+
+	entry.seq = seq
+	entry.len = totalLen
+	entry.valid = true
+	entry.timestamp = time.Now()
+	e.lastPushTime = entry.timestamp
+
+	e.totalIn.Add(1)
+	e.totalOut.Add(1)
+
+	return SystematicShard{
+		BaseSeq:  seq,
+		Mask:     NewBitset256FromUint64(1),
+		Data:     entry.data[:totalLen],
+		IsParity: false,
+	}, nil
+}
+
+// GenerateParity produces an innovative GF(2) linear combination across active packets in the sliding window.
+// Hot path: strictly 0 heap allocations.
+//
+// WARNING (Buffer Reuse):
+// To achieve strictly 0 heap allocations, the returned ParityShard references an internal
+// reusable scratch buffer (e.parityBuf). Subsequent calls to GenerateParity will overwrite
+// this underlying buffer.
+// If you need to retain or store multiple ParityShards concurrently in memory, you MUST clone
+// the shard using shard.Clone() or serialize it immediately via shard.EncodeTo(dst).
+func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.nextSeq == 0 {
+		return ParityShard{}, ErrZeroPayload
+	}
+
+	now := time.Now()
+
+	// If no packet was pushed within inactivityTimeout, the window is idle
+	if e.inactivityTimeout > 0 && !e.lastPushTime.IsZero() && now.Sub(e.lastPushTime) > e.inactivityTimeout {
+		return ParityShard{}, ErrZeroPayload
+	}
+
+	var minSeq uint64
+	if e.nextSeq > uint64(e.windowSize) {
+		minSeq = e.nextSeq - uint64(e.windowSize)
+	} else {
+		minSeq = 0
+	}
+
+	latestSeq := e.nextSeq - 1
+
+	// Advance minSeq to ignore stale packets older than inactivityTimeout
+	if e.inactivityTimeout > 0 {
+		for minSeq < latestSeq {
+			idx := int(minSeq % uint64(e.windowSize))
+			if e.entries[idx].valid && now.Sub(e.entries[idx].timestamp) <= e.inactivityTimeout {
+				break
+			}
+			minSeq++
+		}
+	}
+
+	activeCount := int(latestSeq - minSeq + 1)
+	if activeCount <= 0 {
+		return ParityShard{}, ErrZeroPayload
+	}
+	if activeCount > e.windowSize {
+		activeCount = e.windowSize
+	}
+
+	baseSeq := minSeq
+
+	// Generate mask: if single active packet, mask = 1
+	var mask Bitset256
+	if activeCount == 1 {
+		mask.SetBit(0)
+	} else {
+		// Fill mask bits up to activeCount using SplitMix64 words
+		remaining := activeCount
+		wordIdx := 0
+		for remaining > 0 {
+			r := e.nextRand()
+			if remaining >= 64 {
+				mask[wordIdx] = r
+				remaining -= 64
+			} else {
+				mask[wordIdx] = r & ((uint64(1) << remaining) - 1)
+				remaining = 0
+			}
+			wordIdx++
+		}
+
+		// Ensure the latest packet is ALWAYS included in the parity combination
+		mask.SetBit(activeCount - 1)
+
+		// Ensure at least 2 packets are included if activeCount >= 2
+		if mask.Weight() < 2 {
+			if !mask.TestBit(0) {
+				mask.SetBit(0)
+			} else if activeCount > 1 && !mask.TestBit(1) {
+				mask.SetBit(1)
+			}
+		}
+	}
+
+	ClearBytes(e.parityBuf)
+	maxLen := 0
+
+	// Combine all packets selected by the bitmask via SIMD XOR
+	for b := 0; b < activeCount; b++ {
+		if !mask.TestBit(b) {
+			continue
+		}
+		targetSeq := baseSeq + uint64(b)
+		idx := int(targetSeq % uint64(e.windowSize))
+		entry := &e.entries[idx]
+
+		if !entry.valid || entry.seq != targetSeq {
+			// Clear bit if packet was already evicted
+			mask.ClearBit(b)
+			continue
+		}
+
+		if entry.len > maxLen {
+			maxLen = entry.len
+		}
+		XORBytes(e.parityBuf, entry.data, entry.len)
+	}
+
+	if mask.IsZero() || maxLen == 0 {
+		return ParityShard{}, ErrZeroPayload
+	}
+
+	e.totalOut.Add(1)
+
+	return ParityShard{
+		BaseSeq:  baseSeq,
+		Mask:     mask,
+		Data:     e.parityBuf[:maxLen],
+		IsParity: true,
+	}, nil
+}
+
+// WindowState returns the current base sequence, latest sequence, and active packet count.
+func (e *SlidingWindowEncoder) WindowState() (baseSeq, latestSeq uint64, count int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.nextSeq == 0 {
+		return 0, 0, 0
+	}
+	latestSeq = e.nextSeq - 1
+	if e.nextSeq > uint64(e.windowSize) {
+		baseSeq = e.nextSeq - uint64(e.windowSize)
+	} else {
+		baseSeq = 0
+	}
+	count = int(latestSeq - baseSeq + 1)
+	return baseSeq, latestSeq, count
+}
+
+// ActivePacketCount returns the number of active packets currently retained in the sliding window.
+func (e *SlidingWindowEncoder) ActivePacketCount() int {
+	_, _, count := e.WindowState()
+	return count
+}
+
+// WindowSize returns the configured window capacity W.
+func (e *SlidingWindowEncoder) WindowSize() int {
+	return e.windowSize
+}
+
+// Reset clears the sliding window encoder state and resets the sequence counter.
+func (e *SlidingWindowEncoder) Reset() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for i := range e.entries {
+		e.entries[i].valid = false
+		e.entries[i].seq = 0
+		e.entries[i].len = 0
+	}
+	e.nextSeq = 0
+	e.lastPushTime = time.Time{}
+}
+
+// Stats returns the total count of packets ingested (in) and shards emitted (out).
+func (e *SlidingWindowEncoder) Stats() (in, out uint64) {
+	return e.totalIn.Load(), e.totalOut.Load()
+}
