@@ -79,15 +79,17 @@ import (
 )
 
 func main() {
+	// Mode A: Default Safe Mode (Push and GenerateParity return independent cloned slices):
 	encoder := rlnc.NewSlidingEncoder(rlnc.EncoderConfig{
 		WindowSize:        32,                  // Number of source packets in active sliding window
 		SymbolSize:        1400,                // Maximum payload size per packet
 		InactivityTimeout: 150 * time.Millisecond,
+		ZeroCopy:          false,               // Safe memory cloning by default
 	})
 
 	payload := []byte("Hello, High-Performance RLNC!")
 
-	// 1. Emit systematic shard (0 heap allocations)
+	// 1. Emit systematic shard (caller owns shard.Data memory)
 	sysShard, err := encoder.Push(payload)
 	if err != nil {
 		panic(err)
@@ -99,9 +101,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	// Note: parityShard.Data reuses an internal buffer for 0-alloc performance.
-	// Use parityShard.Clone() if storing or queueing multiple parity shards in memory!
 	fmt.Printf("Emitted Parity Shard: BaseSeq=%d, Mask=%s\n", parityShard.BaseSeq, parityShard.Mask)
+
+	// Mode B: Zero-Copy Fast-Path (0 allocs/op):
+	// Set ZeroCopy: true in EncoderConfig. Shards point directly to internal encoder buffers.
 }
 ```
 

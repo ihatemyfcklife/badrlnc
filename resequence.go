@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+type reseqItem struct {
+	seq      uint64
+	pkt      []byte
+	isPooled bool
+}
+
 // InOrderResequencer guarantees strictly monotonic in-order packet delivery.
 // In asymmetric multi-path routing or delayed RLNC Gaussian substitution, packets may arrive with slight jitter.
 // By reordering packets before delivering to the higher layer (e.g. TUN device or TCP stack),
@@ -21,6 +27,7 @@ type InOrderResequencer struct {
 	timer       *time.Timer
 	onEmit      func(seq uint64, packet []byte)
 	isClosed    bool
+	pendingEmit []reseqItem
 
 	// Telemetry
 	delivered   uint64
@@ -41,10 +48,11 @@ func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(se
 	}
 
 	r := &InOrderResequencer{
-		maxWait:    maxWait,
-		maxPending: maxPending,
-		pending:    make(map[uint64][]byte),
-		onEmit:     onEmit,
+		maxWait:     maxWait,
+		maxPending:  maxPending,
+		pending:     make(map[uint64][]byte),
+		onEmit:      onEmit,
+		pendingEmit: make([]reseqItem, 0, 16),
 	}
 	for i := range r.emittedRing {
 		r.emittedRing[i] = ^uint64(0)
@@ -56,11 +64,12 @@ func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(se
 // If it arrived out of order, it is buffered in the pool until the gap is filled or maxWait expires.
 func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.isClosed {
+		r.mu.Unlock()
 		return
 	}
+
+	r.pendingEmit = r.pendingEmit[:0]
 
 	if !r.initialized {
 		if seq <= 128 {
@@ -72,7 +81,6 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 		}
 		r.initialized = true
 	} else if r.delivered == 0 && seq < r.expectedSeq {
-		// Adjust initial sequence if an earlier sequence arrives before any delivery
 		r.expectedSeq = seq
 	}
 
@@ -87,64 +95,98 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 
 	if diff == 0 {
 		// Zero-delay fast-path: packet is strictly in order.
-		// Emit immediately without buffer copy.
-		if r.onEmit != nil {
-			r.onEmit(seq, packet)
-		}
+		r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
 		r.emittedRing[seq%2048] = seq
 		r.expectedSeq++
 		r.delivered++
 		r.drainConsecutiveLocked()
-		return
-	}
-
-	if diff < 0 {
-		// Late packet after gap skip: deliver if never previously emitted
+	} else if diff < 0 {
+		// Late packet after gap skip: deliver if within history window and never previously emitted.
+		// Older stale/replayed packets (diff <= -1024) or duplicates are dropped safely without resetting state.
 		if diff > -1024 && r.emittedRing[seq%2048] != seq {
-			if r.onEmit != nil {
-				r.onEmit(seq, packet)
-			}
+			r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
 			r.emittedRing[seq%2048] = seq
 			r.delivered++
 		}
-		return
+	} else {
+		// diff > 0: future packet arrived out of order.
+		if _, exists := r.pending[seq]; !exists {
+			// Buffer in pooled slice.
+			buf := GetPacketBuffer()
+			n := copy(buf, packet)
+			r.pending[seq] = buf[:n]
+			r.reordered++
+
+			if len(r.pending) >= r.maxPending {
+				// Buffer limit reached: force skip to lowest pending sequence
+				r.gapsSkipped++
+				r.skipToLowestPendingLocked()
+			} else if r.timer == nil {
+				// Ensure timeout timer is running
+				r.timer = time.AfterFunc(r.maxWait, r.onTimeout)
+			}
+		}
 	}
 
-	// diff > 0: future packet arrived out of order.
-	if _, exists := r.pending[seq]; exists {
-		return // Ignore duplicate out-of-order packet without allocating
+	var stackEmit [16]reseqItem
+	var toEmit []reseqItem
+	nEmit := len(r.pendingEmit)
+	if nEmit > 0 {
+		if nEmit <= len(stackEmit) {
+			copy(stackEmit[:], r.pendingEmit)
+			toEmit = stackEmit[:nEmit]
+		} else {
+			toEmit = make([]reseqItem, nEmit)
+			copy(toEmit, r.pendingEmit)
+		}
 	}
+	r.mu.Unlock()
 
-	// Buffer in pooled slice.
-	buf := GetPacketBuffer()
-	n := copy(buf, packet)
-	r.pending[seq] = buf[:n]
-	r.reordered++
-
-	if len(r.pending) >= r.maxPending {
-		// Buffer limit reached: force skip to lowest pending sequence
-		r.gapsSkipped++
-		r.skipToLowestPendingLocked()
-		return
-	}
-
-	// Ensure timeout timer is running
-	if r.timer == nil {
-		r.timer = time.AfterFunc(r.maxWait, r.onTimeout)
+	// Invoke callback outside mutex lock and return buffers to pool
+	for i := range toEmit {
+		if r.onEmit != nil {
+			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+		}
+		if toEmit[i].isPooled {
+			PutPacketBuffer(toEmit[i].pkt)
+		}
 	}
 }
 
 func (r *InOrderResequencer) onTimeout() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.isClosed || len(r.pending) == 0 {
 		r.timer = nil
+		r.mu.Unlock()
 		return
 	}
 
+	r.pendingEmit = r.pendingEmit[:0]
 	r.gapsSkipped++
 	r.skipToLowestPendingLocked()
+
+	var stackEmit [16]reseqItem
+	var toEmit []reseqItem
+	nEmit := len(r.pendingEmit)
+	if nEmit > 0 {
+		if nEmit <= len(stackEmit) {
+			copy(stackEmit[:], r.pendingEmit)
+			toEmit = stackEmit[:nEmit]
+		} else {
+			toEmit = make([]reseqItem, nEmit)
+			copy(toEmit, r.pendingEmit)
+		}
+	}
+	r.mu.Unlock()
+
+	for i := range toEmit {
+		if r.onEmit != nil {
+			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+		}
+		if toEmit[i].isPooled {
+			PutPacketBuffer(toEmit[i].pkt)
+		}
+	}
 }
 
 func (r *InOrderResequencer) skipToLowestPendingLocked() {
@@ -183,11 +225,12 @@ func (r *InOrderResequencer) drainConsecutiveLocked() {
 			break
 		}
 		delete(r.pending, r.expectedSeq)
-		if r.onEmit != nil {
-			r.onEmit(r.expectedSeq, nextPkt)
-		}
+		r.pendingEmit = append(r.pendingEmit, reseqItem{
+			seq:      r.expectedSeq,
+			pkt:      nextPkt,
+			isPooled: true,
+		})
 		r.emittedRing[r.expectedSeq%2048] = r.expectedSeq
-		PutPacketBuffer(nextPkt)
 		r.expectedSeq++
 		r.delivered++
 	}
@@ -211,9 +254,32 @@ func (r *InOrderResequencer) drainAllPendingLocked() {
 // Close stops running timers and flushes all pending buffered packets.
 func (r *InOrderResequencer) Close() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.isClosed = true
+	r.pendingEmit = r.pendingEmit[:0]
 	r.drainAllPendingLocked()
+
+	var stackEmit [16]reseqItem
+	var toEmit []reseqItem
+	nEmit := len(r.pendingEmit)
+	if nEmit > 0 {
+		if nEmit <= len(stackEmit) {
+			copy(stackEmit[:], r.pendingEmit)
+			toEmit = stackEmit[:nEmit]
+		} else {
+			toEmit = make([]reseqItem, nEmit)
+			copy(toEmit, r.pendingEmit)
+		}
+	}
+	r.mu.Unlock()
+
+	for i := range toEmit {
+		if r.onEmit != nil {
+			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+		}
+		if toEmit[i].isPooled {
+			PutPacketBuffer(toEmit[i].pkt)
+		}
+	}
 }
 
 // Reset clears all pending records and resets the expected sequence.

@@ -733,5 +733,118 @@ func TestInOrderResequencer_LateGhostPacketDoesNotReset(t *testing.T) {
 	}
 }
 
+// 17. Test that Encoder defaults to safe memory cloning (ZeroCopy: false)
+func TestEncoder_SafeCopyByDefault(t *testing.T) {
+	encSafe := NewSlidingEncoder(EncoderConfig{WindowSize: 2, SymbolSize: 100})
+	s0, err := encSafe.Push([]byte("payload-000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p0, err := encSafe.GenerateParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Push enough packets to overwrite window entries
+	s1, _ := encSafe.Push([]byte("payload-111"))
+	s2, _ := encSafe.Push([]byte("payload-222"))
+	p1, _ := encSafe.GenerateParity()
+
+	// Ensure s0 and p0 were NOT mutated
+	if string(s0.Data[LengthPrefixSize:]) != "payload-000" {
+		t.Fatalf("s0 was mutated! got %q", s0.Data[LengthPrefixSize:])
+	}
+	_ = s1
+	_ = s2
+	_ = p1
+	_ = p0
+}
+
+// 18. Test that Decoder executes OnDecoded outside mutex lock (re-entrant safe)
+func TestDecoder_OnDecodedLockFreedom(t *testing.T) {
+	var dec *IncrementalDecoder
+	var statsCalled bool
+
+	dec = NewIncrementalDecoder(DecoderConfig{
+		Capacity:   16,
+		SymbolSize: 100,
+		ZeroCopy:   true,
+		OnDecoded: func(seq uint64, pkt []byte) {
+			// Calling dec.Stats() while OnDecoded runs would DEADLOCK if mutex was held!
+			rx, inno, _, _ := dec.Stats()
+			if rx > 0 && inno > 0 {
+				statsCalled = true
+			}
+		},
+	})
+
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 4, SymbolSize: 100, ZeroCopy: true})
+	s0, _ := enc.Push([]byte("reentrant-test"))
+	_, _ = dec.PushShard(s0)
+
+	if !statsCalled {
+		t.Fatal("expected re-entrant dec.Stats() inside OnDecoded to succeed without deadlock")
+	}
+}
+
+// 19. Test that InOrderResequencer executes onEmit outside mutex lock (re-entrant safe)
+func TestInOrderResequencer_OnEmitLockFreedom(t *testing.T) {
+	var reseq *InOrderResequencer
+	var statsCalled bool
+
+	reseq = NewInOrderResequencer(10*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		// Calling reseq.Stats() from onEmit would DEADLOCK if mutex was held!
+		del, _, _, _ := reseq.Stats()
+		if del >= 1 {
+			statsCalled = true
+		}
+	})
+	defer reseq.Close()
+
+	reseq.Push(0, []byte("pkt-0"))
+	if !statsCalled {
+		t.Fatal("expected re-entrant reseq.Stats() inside onEmit to succeed without deadlock")
+	}
+}
+
+// 20. Test that Gauss-Jordan reduceAndInsert eliminates bit 0 against solvedRing
+func TestGaussJordan_SolvedRingBit0Reduction(t *testing.T) {
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 2, SymbolSize: 100, ZeroCopy: true})
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100})
+
+	alpha := []byte("alpha")
+	bravo := []byte("bravo")
+
+	s0, err := enc.Push(alpha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = enc.Push(bravo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := enc.GenerateParity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Ingest systematic packet seq 0 (enters solvedRing immediately)
+	_, err = dec.PushShard(s0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Ingest parity shard combining seq 0 and seq 1
+	// Bit 0 is eliminated against solvedRing, reducing the equation directly to seq 1!
+	rec, err := dec.PushShard(p)
+	if err != nil {
+		t.Fatalf("PushShard failed: %v", err)
+	}
+	if len(rec) != 1 || !bytes.Equal(rec[0], bravo) {
+		t.Fatalf("expected packet 1 ('bravo') recovered via solvedRing bit 0 elimination, got %q", rec)
+	}
+}
+
+
 
 

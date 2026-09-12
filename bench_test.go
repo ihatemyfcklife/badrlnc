@@ -42,7 +42,7 @@ func BenchmarkSIMDXOR_Multi4_1400B(b *testing.B) {
 
 // BenchmarkEncoder_Push_ZeroAlloc verifies that SlidingWindowEncoder.Push achieves strictly 0 allocs/op.
 func BenchmarkEncoder_Push_ZeroAlloc(b *testing.B) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400, ZeroCopy: true})
 	payload := make([]byte, 1200)
 	_, _ = rand.Read(payload)
 
@@ -56,7 +56,7 @@ func BenchmarkEncoder_Push_ZeroAlloc(b *testing.B) {
 
 // BenchmarkEncoder_GenerateParity_ZeroAlloc verifies that SlidingWindowEncoder.GenerateParity achieves 0 allocs/op.
 func BenchmarkEncoder_GenerateParity_ZeroAlloc(b *testing.B) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400, ZeroCopy: true})
 	payload := make([]byte, 1200)
 	_, _ = rand.Read(payload)
 
@@ -75,7 +75,7 @@ func BenchmarkEncoder_GenerateParity_ZeroAlloc(b *testing.B) {
 // BenchmarkSystematicFastPath_ZeroAlloc verifies that full end-to-end systematic encode + decode
 // achieves strictly 0 heap allocations per operation with ZeroCopy enabled.
 func BenchmarkSystematicFastPath_ZeroAlloc(b *testing.B) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400, ZeroCopy: true})
 	dec := NewIncrementalDecoder(DecoderConfig{
 		Capacity:   2048,
 		SymbolSize: 1400,
@@ -97,7 +97,7 @@ func BenchmarkSystematicFastPath_ZeroAlloc(b *testing.B) {
 // BenchmarkDecoder_IncrementalRREF_Kpps benchmarks incremental Gauss-Jordan RREF decoding
 // and reports throughput in packets/sec (Kpps).
 func BenchmarkDecoder_IncrementalRREF_Kpps(b *testing.B) {
-	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400})
+	enc := NewSlidingEncoder(EncoderConfig{WindowSize: 32, SymbolSize: 1400, ZeroCopy: true})
 	dec := NewIncrementalDecoder(DecoderConfig{
 		Capacity:   2048,
 		SymbolSize: 1400,

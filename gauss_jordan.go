@@ -121,7 +121,18 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 			curSeq += uint64(tz)
 		}
 
-		// Eliminate leading variable curSeq if an active pivot already exists
+		// 1. Eliminate leading variable curSeq if already solved in solvedRing
+		rec := &d.solvedRing[curSeq%uint64(d.capacity)]
+		if rec.solved && rec.seq == curSeq {
+			curMask.ClearBit(0)
+			XORBytes(scratch, rec.data, rec.len)
+			if rec.len > payloadLen {
+				payloadLen = rec.len
+			}
+			continue
+		}
+
+		// 2. Eliminate leading variable curSeq if an active pivot already exists
 		p := &d.pivots[curSeq%uint64(d.capacity)]
 		if p.active && p.seq == curSeq {
 			curMask.XOR(p.mask)
@@ -286,7 +297,10 @@ func (d *IncrementalDecoder) recordAndEmitSolved(seq uint64, data []byte) {
 
 	recoveredPayload := rec.data[LengthPrefixSize:totalRecordLen]
 	if d.onDecoded != nil {
-		d.onDecoded(seq, recoveredPayload)
+		d.pendingEmit = append(d.pendingEmit, decodedItem{
+			seq: seq,
+			pkt: recoveredPayload,
+		})
 	}
 
 	if !d.zeroCopy {

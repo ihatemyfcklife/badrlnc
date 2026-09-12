@@ -37,6 +37,11 @@ type DecoderConfig struct {
 // IncrementalDecoder implements an on-the-fly GF(2) linear solver with cascade back-substitution.
 // It reconstructs lost source packets immediately upon receiving innovative shards without block delays.
 // It is fully safe for concurrent use.
+type decodedItem struct {
+	seq uint64
+	pkt []byte
+}
+
 type IncrementalDecoder struct {
 	mu         sync.Mutex
 	capacity   int
@@ -49,6 +54,7 @@ type IncrementalDecoder struct {
 	scratch          []byte
 	carryOverBuf     []byte
 	recoveredScratch [][]byte
+	pendingEmit      []decodedItem
 
 	// Telemetry
 	shardsReceived   atomic.Uint64
@@ -91,8 +97,9 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 		pivots:           pivots,
 		solvedRing:       solved,
 		scratch:          make([]byte, internalSymbolCapacity),
-		carryOverBuf:      make([]byte, internalSymbolCapacity),
-		recoveredScratch:  make([][]byte, 0, 64),
+		carryOverBuf:     make([]byte, internalSymbolCapacity),
+		recoveredScratch: make([][]byte, 0, 64),
+		pendingEmit:      make([]decodedItem, 0, 16),
 	}
 }
 
@@ -115,22 +122,42 @@ func (d *IncrementalDecoder) PushShard(shard Shard) (recovered [][]byte, err err
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	d.shardsReceived.Add(1)
 	if !d.zeroCopy {
 		d.recoveredScratch = d.recoveredScratch[:0]
 	}
+	d.pendingEmit = d.pendingEmit[:0]
 
 	// Process shard through the incremental Gauss-Jordan solver
 	d.processShardLocked(shard)
 
-	if d.zeroCopy || len(d.recoveredScratch) == 0 {
-		return nil, nil
+	var stackEmit [16]decodedItem
+	var toEmit []decodedItem
+	nEmit := len(d.pendingEmit)
+	if nEmit > 0 {
+		if nEmit <= len(stackEmit) {
+			copy(stackEmit[:], d.pendingEmit)
+			toEmit = stackEmit[:nEmit]
+		} else {
+			toEmit = make([]decodedItem, nEmit)
+			copy(toEmit, d.pendingEmit)
+		}
 	}
 
-	res := make([][]byte, len(d.recoveredScratch))
-	copy(res, d.recoveredScratch)
+	var res [][]byte
+	if !d.zeroCopy && len(d.recoveredScratch) > 0 {
+		res = make([][]byte, len(d.recoveredScratch))
+		copy(res, d.recoveredScratch)
+	}
+	d.mu.Unlock()
+
+	// Invoke callback outside the mutex lock to prevent lock contention and deadlocks
+	if d.onDecoded != nil && len(toEmit) > 0 {
+		for i := range toEmit {
+			d.onDecoded(toEmit[i].seq, toEmit[i].pkt)
+		}
+	}
+
 	return res, nil
 }
 

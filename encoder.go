@@ -24,6 +24,14 @@ type EncoderConfig struct {
 
 	// Seed is an optional initial seed for the SplitMix64 PRNG generating parity coefficients.
 	Seed uint64
+
+	// ZeroCopy specifies whether emitted Shards reuse internal encoder buffers.
+	// When false (default): Push() and GenerateParity() return freshly cloned Data slices.
+	//   The caller owns the memory and can retain, queue, or send across goroutines indefinitely.
+	// When true: Shard.Data points directly to internal encoder ring and parity buffers.
+	//   Strictly 0 heap allocations on Push() and GenerateParity().
+	//   Callers must clone or serialize before subsequent encoder calls.
+	ZeroCopy bool
 }
 
 type encoderEntry struct {
@@ -42,6 +50,7 @@ type SlidingWindowEncoder struct {
 	windowSize        int
 	symbolSize        int
 	inactivityTimeout time.Duration
+	zeroCopy          bool
 	entries           []encoderEntry
 	nextSeq           uint64
 	totalIn           atomic.Uint64
@@ -86,6 +95,7 @@ func NewSlidingEncoder(cfg EncoderConfig) *SlidingWindowEncoder {
 		windowSize:        windowSize,
 		symbolSize:        symbolSize,
 		inactivityTimeout: inactivityTimeout,
+		zeroCopy:          cfg.ZeroCopy,
 		entries:           entries,
 		nextSeq:           0,
 		rngState:          seed,
@@ -103,9 +113,10 @@ func (e *SlidingWindowEncoder) nextRand() uint64 {
 }
 
 // Push ingests a raw payload into the sliding window and returns its corresponding SystematicShard.
-// Fast-path: strictly 0 heap allocations.
-// Note: SystematicShard.Data references the encoder's internal circular window entry for line-rate throughput.
-// If retaining or queueing shards across more than WindowSize subsequent pushes, use shard.Clone().
+// Memory Ownership:
+//   - Default (ZeroCopy: false): SystematicShard.Data is a freshly allocated clone owned by the caller.
+//   - ZeroCopy (ZeroCopy: true): SystematicShard.Data points directly to the encoder's internal circular
+//     window buffer (strictly 0 heap allocations). Callers must clone or serialize before subsequent calls.
 func (e *SlidingWindowEncoder) Push(payload []byte) (SystematicShard, error) {
 	n := len(payload)
 	if n == 0 {
@@ -142,23 +153,26 @@ func (e *SlidingWindowEncoder) Push(payload []byte) (SystematicShard, error) {
 	e.totalIn.Add(1)
 	e.totalOut.Add(1)
 
+	outData := entry.data[:totalLen]
+	if !e.zeroCopy {
+		cp := make([]byte, totalLen)
+		copy(cp, outData)
+		outData = cp
+	}
+
 	return SystematicShard{
 		BaseSeq:  seq,
 		Mask:     NewBitset256FromUint64(1),
-		Data:     entry.data[:totalLen],
+		Data:     outData,
 		IsParity: false,
 	}, nil
 }
 
 // GenerateParity produces an innovative GF(2) linear combination across active packets in the sliding window.
-// Hot path: strictly 0 heap allocations.
-//
-// WARNING (Buffer Reuse):
-// To achieve strictly 0 heap allocations, the returned ParityShard references an internal
-// reusable scratch buffer (e.parityBuf). Subsequent calls to GenerateParity will overwrite
-// this underlying buffer.
-// If you need to retain or store multiple ParityShards concurrently in memory, you MUST clone
-// the shard using shard.Clone() or serialize it immediately via shard.EncodeTo(dst).
+// Memory Ownership:
+//   - Default (ZeroCopy: false): ParityShard.Data is a freshly allocated clone owned by the caller.
+//   - ZeroCopy (ZeroCopy: true): ParityShard.Data points directly to the encoder's internal scratch buffer
+//     (strictly 0 heap allocations). Callers must clone or serialize before subsequent calls.
 func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -267,10 +281,17 @@ func (e *SlidingWindowEncoder) GenerateParity() (ParityShard, error) {
 
 	e.totalOut.Add(1)
 
+	outData := e.parityBuf[:maxLen]
+	if !e.zeroCopy {
+		cp := make([]byte, maxLen)
+		copy(cp, outData)
+		outData = cp
+	}
+
 	return ParityShard{
 		BaseSeq:  baseSeq,
 		Mask:     mask,
-		Data:     e.parityBuf[:maxLen],
+		Data:     outData,
 		IsParity: true,
 	}, nil
 }
