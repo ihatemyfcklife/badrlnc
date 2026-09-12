@@ -161,11 +161,7 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 				minBit = 1 // Skip bit 0 (leading variable)
 			}
 			for minBit < 64 {
-				var mask uint64
-				if minBit > 0 {
-					mask = (^uint64(0)) >> (64 - minBit)
-				}
-				word := curMask[w] &^ mask
+				word := curMask[w] & (^uint64(0) << minBit)
 				if word == 0 {
 					break
 				}
