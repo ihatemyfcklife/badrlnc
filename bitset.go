@@ -53,6 +53,29 @@ func (b Bitset256) TrailingZeros() int {
 	return -1
 }
 
+// LeadingZeros returns the number of leading zero bits before the highest set bit (0..256).
+// If all bits are zero, it returns 256.
+func (b Bitset256) LeadingZeros() int {
+	if b[3] != 0 {
+		return bits.LeadingZeros64(b[3])
+	}
+	if b[2] != 0 {
+		return 64 + bits.LeadingZeros64(b[2])
+	}
+	if b[1] != 0 {
+		return 128 + bits.LeadingZeros64(b[1])
+	}
+	if b[0] != 0 {
+		return 192 + bits.LeadingZeros64(b[0])
+	}
+	return 256
+}
+
+// HighestBit returns the index of the highest set bit (0..255), or -1 if the bitset is zero.
+func (b Bitset256) HighestBit() int {
+	return 255 - b.LeadingZeros()
+}
+
 // SetBit sets bit at index i (0..255) to 1. Out-of-bounds indices are ignored.
 func (b *Bitset256) SetBit(i int) {
 	if i < 0 || i >= 256 {

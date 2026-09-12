@@ -170,6 +170,13 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 				subSeq := curSeq + uint64(k)
 				subP := &d.pivots[subSeq%uint64(d.capacity)]
 				if subP.active && subP.seq == subSeq {
+					// Guard against bitset overflow: if shifting subP.mask by k causes any set bit
+					// to exceed index 255, ShiftLeft(k) would discard that variable from the mask,
+					// desynchronizing the mathematical equation from scratch.
+					if subP.mask.HighestBit()+k >= 256 {
+						minBit = t + 1
+						continue
+					}
 					shifted := subP.mask.ShiftLeft(k)
 					curMask.XOR(shifted)
 					XORBytes(scratch, subP.data, subP.len)

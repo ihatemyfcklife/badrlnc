@@ -3,6 +3,7 @@ package rlnc
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,27 @@ func TestBitset256(t *testing.T) {
 	str := bFromU64.String()
 	if len(str) == 0 {
 		t.Fatal("String() returned empty string")
+	}
+
+	// Test LeadingZeros and HighestBit
+	var emptyBs Bitset256
+	if emptyBs.LeadingZeros() != 256 || emptyBs.HighestBit() != -1 {
+		t.Fatalf("empty bitset LeadingZeros/HighestBit failed: lz=%d hb=%d", emptyBs.LeadingZeros(), emptyBs.HighestBit())
+	}
+
+	single0 := NewBitset256(0)
+	if single0.LeadingZeros() != 255 || single0.HighestBit() != 0 {
+		t.Fatalf("bit 0 LeadingZeros/HighestBit failed: lz=%d hb=%d", single0.LeadingZeros(), single0.HighestBit())
+	}
+
+	single255 := NewBitset256(255)
+	if single255.LeadingZeros() != 0 || single255.HighestBit() != 255 {
+		t.Fatalf("bit 255 LeadingZeros/HighestBit failed: lz=%d hb=%d", single255.LeadingZeros(), single255.HighestBit())
+	}
+
+	multi := NewBitset256(10, 150, 250)
+	if multi.HighestBit() != 250 || multi.LeadingZeros() != 5 {
+		t.Fatalf("multi bitset LeadingZeros/HighestBit failed: lz=%d hb=%d", multi.LeadingZeros(), multi.HighestBit())
 	}
 }
 
@@ -612,4 +634,61 @@ func TestDecoder_ZeroCopy_RequiresOnDecodedPanic(t *testing.T) {
 	}()
 	_ = NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100, ZeroCopy: true, OnDecoded: nil})
 }
+
+// 15. Test that ShiftLeft bitset overflow (> 255) is safely skipped without corrupting the matrix
+func TestGaussJordan_BitsetShiftOverflowGuard(t *testing.T) {
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 64, SymbolSize: 100})
+
+	// Inject a pivot at subSeq=10 whose mask spans up to bit 250 (HighestBit() = 250)
+	var pData [102]byte
+	binary.BigEndian.PutUint16(pData[:2], 4)
+	copy(pData[2:6], []byte("piv0"))
+
+	sPiv := Shard{
+		BaseSeq: 10,
+		Mask:    NewBitset256(0, 250),
+		Data:    pData[:6],
+	}
+	_, err := dec.PushShard(sPiv)
+	if err != nil {
+		t.Fatalf("failed to insert initial pivot: %v", err)
+	}
+
+	// Now send a shard at curSeq=0 that has bit 10 set (which matches subSeq=10).
+	// Shifting sPiv by k=10 would shift bit 250 to index 260 (which exceeds 255).
+	// With the guard, the shift is safely skipped and no algebraic corruption occurs.
+	var sData [102]byte
+	binary.BigEndian.PutUint16(sData[:2], 4)
+	copy(sData[2:6], []byte("cur0"))
+
+	sCur := Shard{
+		BaseSeq: 0,
+		Mask:    NewBitset256(0, 10),
+		Data:    sData[:6],
+	}
+	_, err = dec.PushShard(sCur)
+	if err != nil {
+		t.Fatalf("PushShard failed: %v", err)
+	}
+
+	// Assert decoder is still in a healthy state and can decode subsequent systematic packets
+	sysPkt := []byte("clean-packet")
+	var sysData [102]byte
+	binary.BigEndian.PutUint16(sysData[:2], uint16(len(sysPkt)))
+	copy(sysData[2:], sysPkt)
+
+	sSys := Shard{
+		BaseSeq: 20,
+		Mask:    NewBitset256(0),
+		Data:    sysData[:2+len(sysPkt)],
+	}
+	rec, err := dec.PushShard(sSys)
+	if err != nil {
+		t.Fatalf("PushShard systematic failed: %v", err)
+	}
+	if len(rec) != 1 || !bytes.Equal(rec[0], sysPkt) {
+		t.Fatalf("expected clean systematic recovery, got %q", rec)
+	}
+}
+
 
