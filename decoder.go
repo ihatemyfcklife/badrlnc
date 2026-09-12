@@ -3,7 +3,6 @@ package rlnc
 import (
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // DecoderConfig defines configuration parameters for IncrementalDecoder.
@@ -15,10 +14,6 @@ type DecoderConfig struct {
 	// SymbolSize specifies the maximum raw payload size in bytes per packet.
 	// Default is DefaultSymbolSize (1400 bytes).
 	SymbolSize int
-
-	// InactivityTimeout is the maximum duration an unsolved pivot remains active before eviction.
-	// Default is 150ms.
-	InactivityTimeout time.Duration
 
 	// ZeroCopy enables strictly 0-allocation packet delivery via OnDecoded streaming.
 	//
@@ -43,12 +38,11 @@ type DecoderConfig struct {
 // It reconstructs lost source packets immediately upon receiving innovative shards without block delays.
 // It is fully safe for concurrent use.
 type IncrementalDecoder struct {
-	mu                sync.Mutex
-	capacity          int
-	symbolSize        int
-	inactivityTimeout time.Duration
-	zeroCopy          bool
-	onDecoded         func(seq uint64, packet []byte)
+	mu         sync.Mutex
+	capacity   int
+	symbolSize int
+	zeroCopy   bool
+	onDecoded  func(seq uint64, packet []byte)
 
 	pivots           []PivotEntry
 	solvedRing       []solvedRecord
@@ -90,14 +84,13 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 	}
 
 	return &IncrementalDecoder{
-		capacity:          capacity,
-		symbolSize:        symbolSize,
-		inactivityTimeout: cfg.InactivityTimeout,
-		zeroCopy:          cfg.ZeroCopy,
-		onDecoded:         cfg.OnDecoded,
-		pivots:            pivots,
-		solvedRing:        solved,
-		scratch:           make([]byte, internalSymbolCapacity),
+		capacity:         capacity,
+		symbolSize:       symbolSize,
+		zeroCopy:         cfg.ZeroCopy,
+		onDecoded:        cfg.OnDecoded,
+		pivots:           pivots,
+		solvedRing:       solved,
+		scratch:          make([]byte, internalSymbolCapacity),
 		carryOverBuf:      make([]byte, internalSymbolCapacity),
 		recoveredScratch:  make([][]byte, 0, 64),
 	}

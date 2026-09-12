@@ -78,8 +78,8 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 
 	diff := int64(seq - r.expectedSeq)
 
-	// Detect remote sequence reset or aberrant jump
-	if diff < -10000 || diff > 100000 {
+	// Detect remote sequence aberrant forward jump (e.g. sequence number discontinuity > 100,000)
+	if diff > 100000 {
 		r.drainAllPendingLocked()
 		r.expectedSeq = seq
 		diff = 0

@@ -691,4 +691,47 @@ func TestGaussJordan_BitsetShiftOverflowGuard(t *testing.T) {
 	}
 }
 
+// 16. Test that stale/ghost/replayed packets (diff < 0) never wipe pending resequencer queues
+func TestInOrderResequencer_LateGhostPacketDoesNotReset(t *testing.T) {
+	var deliveredSeqs []uint64
+	reseq := NewInOrderResequencer(50*time.Millisecond, 100, func(seq uint64, pkt []byte) {
+		deliveredSeqs = append(deliveredSeqs, seq)
+	})
+	defer reseq.Close()
+
+	// 1. Deliver packet 10,000 in-order
+	reseq.Push(10000, []byte("pkt-10000"))
+	if len(deliveredSeqs) != 1 || deliveredSeqs[0] != 10000 {
+		t.Fatalf("expected packet 10000 delivered, got %v", deliveredSeqs)
+	}
+
+	// 2. Push packet 10,002 (leaves gap at 10,001)
+	reseq.Push(10002, []byte("pkt-10002"))
+	_, _, _, pending := reseq.Stats()
+	if pending != 1 {
+		t.Fatalf("expected 1 pending packet (10002), got %d", pending)
+	}
+
+	// 3. Replay an old ghost packet (seq=0, diff = 0 - 10001 = -10001 < -10000)
+	// Must be dropped safely WITHOUT resetting expectedSeq or wiping pending buffer!
+	reseq.Push(0, []byte("ghost-pkt-0"))
+
+	_, _, _, pending = reseq.Stats()
+	if pending != 1 {
+		t.Fatalf("pending queue was incorrectly wiped by ghost packet! pending=%d", pending)
+	}
+
+	// 4. Deliver missing packet 10,001
+	reseq.Push(10001, []byte("pkt-10001"))
+
+	// Both 10,001 and 10,002 must now be delivered in exact sequence
+	if len(deliveredSeqs) != 3 {
+		t.Fatalf("expected 3 delivered packets, got %v", deliveredSeqs)
+	}
+	if deliveredSeqs[1] != 10001 || deliveredSeqs[2] != 10002 {
+		t.Fatalf("packets out of order or corrupted: %v", deliveredSeqs)
+	}
+}
+
+
 
