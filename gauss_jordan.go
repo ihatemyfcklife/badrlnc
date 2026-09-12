@@ -182,6 +182,8 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 					break
 				}
 				t := bits.TrailingZeros64(word)
+				minBit = t + 1
+
 				k := w*64 + t
 				subSeq := curSeq + uint64(k)
 				subP := &d.pivots[subSeq%uint64(d.capacity)]
@@ -190,7 +192,6 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 					// to exceed index 255, ShiftLeft(k) would discard that variable from the mask,
 					// desynchronizing the mathematical equation from scratch.
 					if subP.mask.HighestBit()+k >= 256 {
-						minBit = t + 1
 						continue
 					}
 					shifted := subP.mask.ShiftLeft(k)
@@ -200,7 +201,6 @@ func (d *IncrementalDecoder) reduceAndInsert(curSeq uint64, curMask Bitset256, s
 						payloadLen = subP.len
 					}
 				}
-				minBit = t + 1
 			}
 		}
 

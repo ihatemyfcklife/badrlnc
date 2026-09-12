@@ -27,6 +27,13 @@ type ResequencerConfig struct {
 	//   after OnEmit returns; callers must copy if they need to retain the data.
 	ZeroCopy bool
 
+	// AllowLateDelivery specifies whether late packets arriving after a gap timeout skip
+	// (seq < expectedSeq) should still be delivered to OnEmit (violating strict monotonic sequence ordering).
+	// Default is false: late packets arriving behind expectedSeq are counted as stale
+	// and discarded to preserve strictly monotonic in-order delivery for TCP/TUN stacks.
+	// Set to true only if your higher layer explicitly tolerates or expects out-of-order retrograde packets.
+	AllowLateDelivery bool
+
 	// OnEmit is invoked with the packet and its sequence number strictly in order.
 	OnEmit func(seq uint64, packet []byte)
 }
@@ -37,23 +44,25 @@ type ResequencerConfig struct {
 // it completely eliminates TCP Duplicate ACKs and prevents congestion window collapse.
 // It is safe for concurrent use.
 type InOrderResequencer struct {
-	mu          sync.Mutex
-	maxWait     time.Duration
-	maxPending  int
-	zeroCopy    bool
-	expectedSeq uint64
-	initialized bool
-	pending     map[uint64][]byte
-	emittedRing [2048]uint64
-	timer       *time.Timer
-	onEmit      func(seq uint64, packet []byte)
-	isClosed    bool
-	pendingEmit []reseqItem
+	mu                sync.Mutex
+	maxWait           time.Duration
+	maxPending        int
+	zeroCopy          bool
+	allowLateDelivery bool
+	expectedSeq       uint64
+	initialized       bool
+	pending           map[uint64][]byte
+	emittedRing       [2048]uint64
+	timer             *time.Timer
+	onEmit            func(seq uint64, packet []byte)
+	isClosed          bool
+	pendingEmit       []reseqItem
 
 	// Telemetry
-	delivered   uint64
-	reordered   uint64
-	gapsSkipped uint64
+	delivered    uint64
+	reordered    uint64
+	gapsSkipped  uint64
+	stalePackets uint64
 }
 
 // NewInOrderResequencerWithConfig initializes an InOrderResequencer with full configuration options.
@@ -68,12 +77,13 @@ func NewInOrderResequencerWithConfig(cfg ResequencerConfig) *InOrderResequencer 
 	}
 
 	r := &InOrderResequencer{
-		maxWait:     maxWait,
-		maxPending:  maxPending,
-		zeroCopy:    cfg.ZeroCopy,
-		pending:     make(map[uint64][]byte),
-		onEmit:      cfg.OnEmit,
-		pendingEmit: make([]reseqItem, 0, 16),
+		maxWait:           maxWait,
+		maxPending:        maxPending,
+		zeroCopy:          cfg.ZeroCopy,
+		allowLateDelivery: cfg.AllowLateDelivery,
+		pending:           make(map[uint64][]byte),
+		onEmit:            cfg.OnEmit,
+		pendingEmit:       make([]reseqItem, 0, 16),
 	}
 	for i := range r.emittedRing {
 		r.emittedRing[i] = ^uint64(0)
@@ -87,10 +97,11 @@ func NewInOrderResequencerWithConfig(cfg ResequencerConfig) *InOrderResequencer 
 //   - onEmit: callback invoked with the packet and its sequence number strictly in order.
 func NewInOrderResequencer(maxWait time.Duration, maxPending int, onEmit func(seq uint64, packet []byte)) *InOrderResequencer {
 	return NewInOrderResequencerWithConfig(ResequencerConfig{
-		MaxWait:    maxWait,
-		MaxPending: maxPending,
-		ZeroCopy:   false,
-		OnEmit:     onEmit,
+		MaxWait:           maxWait,
+		MaxPending:        maxPending,
+		ZeroCopy:          false,
+		AllowLateDelivery: false,
+		OnEmit:            onEmit,
 	})
 }
 
@@ -135,12 +146,15 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 		r.delivered++
 		r.drainConsecutiveLocked()
 	} else if diff < 0 {
-		// Late packet after gap skip: deliver if within history window and never previously emitted.
-		// Older stale/replayed packets (diff <= -1024) or duplicates are dropped safely without resetting state.
-		if diff > -1024 && r.emittedRing[seq%2048] != seq {
+		// Late packet arriving after a gap was already skipped (seq < expectedSeq).
+		// By default (AllowLateDelivery: false), retrograde packets are discarded to guarantee
+		// strictly monotonic in-order delivery without TCP duplicate ACKs or congestion window collapse.
+		if r.allowLateDelivery && diff > -1024 && r.emittedRing[seq%2048] != seq {
 			r.pendingEmit = append(r.pendingEmit, reseqItem{seq: seq, pkt: packet, isPooled: false})
 			r.emittedRing[seq%2048] = seq
 			r.delivered++
+		} else {
+			r.stalePackets++
 		}
 	} else {
 		// diff > 0: future packet arrived out of order.
@@ -358,6 +372,14 @@ func (r *InOrderResequencer) Reset() {
 	r.delivered = 0
 	r.reordered = 0
 	r.gapsSkipped = 0
+	r.stalePackets = 0
+}
+
+// StalePackets returns the total number of retrograde packets discarded because they arrived after a gap was skipped.
+func (r *InOrderResequencer) StalePackets() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stalePackets
 }
 
 // Stats returns resequencer telemetry: delivered packets, reordered packets, skipped gaps,

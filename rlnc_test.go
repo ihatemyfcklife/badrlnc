@@ -1214,6 +1214,103 @@ func TestShard_CRC32CastagnoliIntegrity(t *testing.T) {
 	}
 }
 
+// 25. Test that parity shards containing higher variables without existing pivots do not trigger infinite loops
+func TestGaussJordan_HigherVariablesWithoutPivotNoInfiniteLoop(t *testing.T) {
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100})
+
+	// Create a mask with bits set at 0, 5, 68, and 140 (spanning 3 64-bit words)
+	var mask Bitset256
+	mask.SetBit(0)
+	mask.SetBit(5)
+	mask.SetBit(68)
+	mask.SetBit(140)
+
+	payload := make([]byte, LengthPrefixSize+10)
+	binary.BigEndian.PutUint16(payload[:2], 10)
+
+	done := make(chan struct{})
+	go func() {
+		_, err := dec.PushShard(ParityShard{
+			BaseSeq:  10,
+			Mask:     mask,
+			Data:     payload,
+			IsParity: true,
+		})
+		if err != nil {
+			t.Errorf("PushShard failed: %v", err)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded immediately without infinite looping on minBit
+	case <-time.After(1 * time.Second):
+		t.Fatal("PushShard hung in infinite loop in reduceAndInsert while scanning higher variables")
+	}
+}
+
+// 26. Test that InOrderResequencer enforces strictly monotonic ordering by default and drops late packets
+func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) {
+	// 1. Default mode: AllowLateDelivery is false -> strictly monotonic delivery guaranteed
+	var deliveredDefault []uint64
+	reseqDefault := NewInOrderResequencer(10*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		deliveredDefault = append(deliveredDefault, seq)
+	})
+
+	reseqDefault.Push(0, []byte("pkt-0"))
+	// Skip 1, send 2
+	reseqDefault.Push(2, []byte("pkt-2"))
+
+	// Wait for gap skip timer to expire (timeout on 1 -> force skip to 2)
+	time.Sleep(30 * time.Millisecond)
+
+	// Delivered should now be [0, 2]
+	if len(deliveredDefault) != 2 || deliveredDefault[0] != 0 || deliveredDefault[1] != 2 {
+		t.Fatalf("expected [0, 2] delivered after gap skip, got %v", deliveredDefault)
+	}
+
+	// Now deliver missing packet 1 (retrograde arrival)
+	reseqDefault.Push(1, []byte("pkt-1-late"))
+
+	// Packet 1 MUST NOT be emitted (delivered remains [0, 2]) to prevent TCP ACK duplicates
+	if len(deliveredDefault) != 2 {
+		t.Fatalf("strict monotonicity violated: late retrograde packet was emitted: %v", deliveredDefault)
+	}
+	if reseqDefault.StalePackets() != 1 {
+		t.Fatalf("expected 1 stale packet counted, got %d", reseqDefault.StalePackets())
+	}
+	reseqDefault.Close()
+
+	// 2. Explicit AllowLateDelivery: true mode -> permits retrograde delivery if desired
+	var deliveredLate []uint64
+	reseqLate := NewInOrderResequencerWithConfig(ResequencerConfig{
+		MaxWait:           10 * time.Millisecond,
+		MaxPending:        10,
+		AllowLateDelivery: true,
+		OnEmit: func(seq uint64, pkt []byte) {
+			deliveredLate = append(deliveredLate, seq)
+		},
+	})
+
+	reseqLate.Push(0, []byte("pkt-0"))
+	reseqLate.Push(2, []byte("pkt-2"))
+	time.Sleep(30 * time.Millisecond)
+
+	// Now deliver missing packet 1
+	reseqLate.Push(1, []byte("pkt-1-late"))
+
+	// With AllowLateDelivery: true, packet 1 IS delivered as retrograde packet [0, 2, 1]
+	if len(deliveredLate) != 3 || deliveredLate[2] != 1 {
+		t.Fatalf("expected late packet delivered when AllowLateDelivery: true, got %v", deliveredLate)
+	}
+	if reseqLate.StalePackets() != 0 {
+		t.Fatalf("expected 0 stale packets when late delivery allowed, got %d", reseqLate.StalePackets())
+	}
+	reseqLate.Close()
+}
+
+
 
 
 

@@ -22,11 +22,19 @@ type DecoderConfig struct {
 	// requires configuring the OnDecoded callback (NewIncrementalDecoder will panic
 	// if ZeroCopy is true and OnDecoded is nil).
 	//
-	// Behavior:
+	// Behavior & Concurrency:
+	//   - ZeroCopy: false (default): Recovered packets and the outer slice are safely cloned
+	//     into fresh heap allocations and returned from PushShard. Fully safe for concurrent
+	//     use across goroutines.
 	//   - ZeroCopy: true: Recovered packets are streamed directly to OnDecoded without
 	//     allocating slices. PushShard returns (nil, nil) with strictly 0 heap allocations.
-	//   - ZeroCopy: false (default): Recovered packets and the outer slice are safely cloned
-	//     into fresh heap allocations and returned from PushShard.
+	//     Concurrency note: Callbacks are intentionally executed outside the mutex lock to eliminate
+	//     lock contention and allow re-entrant decoder operations. In ZeroCopy mode, packet slices
+	//     point directly to internal circular buffers and are only valid for the duration of the
+	//     callback invocation. If multiple goroutines push shards concurrently to the SAME decoder instance,
+	//     external synchronization is recommended to avoid circular ring buffer aliasing on wrap-around.
+	//     In high-throughput multi-worker architectures, dedicating one IncrementalDecoder per
+	//     network stream/worker is the recommended pattern.
 	ZeroCopy bool
 
 	// OnDecoded is invoked immediately when a source packet is recovered.
@@ -36,7 +44,7 @@ type DecoderConfig struct {
 
 // IncrementalDecoder implements an on-the-fly GF(2) linear solver with cascade back-substitution.
 // It reconstructs lost source packets immediately upon receiving innovative shards without block delays.
-// It is fully safe for concurrent use.
+// Internal solver state transitions are fully thread-safe.
 type decodedItem struct {
 	seq uint64
 	pkt []byte
