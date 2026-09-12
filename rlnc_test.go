@@ -1310,6 +1310,70 @@ func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) 
 	reseqLate.Close()
 }
 
+// 27. Test that InOrderResequencer handles jumbo frames (> 2048 bytes) without truncation
+func TestInOrderResequencer_JumboFramesNoTruncation(t *testing.T) {
+	var delivered [][]byte
+	var deliveredSeqs []uint64
+
+	reseq := NewInOrderResequencer(50*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		deliveredSeqs = append(deliveredSeqs, seq)
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+		delivered = append(delivered, cp)
+	})
+	defer reseq.Close()
+
+	// Jumbo packet of 4096 bytes
+	jumboPkt := make([]byte, 4096)
+	for i := range jumboPkt {
+		jumboPkt[i] = byte(i % 251)
+	}
+
+	pkt0 := []byte("pkt-0")
+
+	// Deliver pkt 1 (jumbo) first -> must be buffered in pending without truncation
+	reseq.Push(1, jumboPkt)
+
+	// Now deliver pkt 0 -> triggers consecutive drain of pkt 0 then pkt 1
+	reseq.Push(0, pkt0)
+
+	if len(delivered) != 2 {
+		t.Fatalf("expected 2 packets delivered, got %d", len(delivered))
+	}
+	if deliveredSeqs[0] != 0 || deliveredSeqs[1] != 1 {
+		t.Fatalf("unexpected order: %v", deliveredSeqs)
+	}
+	if !bytes.Equal(delivered[0], pkt0) {
+		t.Fatalf("pkt 0 content mismatch")
+	}
+	if len(delivered[1]) != 4096 {
+		t.Fatalf("jumbo packet was truncated: expected 4096 bytes, got %d", len(delivered[1]))
+	}
+	if !bytes.Equal(delivered[1], jumboPkt) {
+		t.Fatalf("jumbo packet content corrupted")
+	}
+}
+
+// 28. Test that IncrementalDecoder rejects shards with Data exceeding symbolSize + LengthPrefixSize
+func TestDecoder_OversizedShardReturnsError(t *testing.T) {
+	dec := NewIncrementalDecoder(DecoderConfig{Capacity: 16, SymbolSize: 100})
+
+	// Valid maximum data size is 2 (LengthPrefixSize) + 100 = 102 bytes
+	oversizedData := make([]byte, 103)
+	binary.BigEndian.PutUint16(oversizedData[:2], 101)
+
+	shard := Shard{
+		BaseSeq: 0,
+		Mask:    NewBitset256(0, 0),
+		Data:    oversizedData,
+	}
+
+	_, err := dec.PushShard(shard)
+	if err != ErrPayloadTooLarge {
+		t.Fatalf("expected ErrPayloadTooLarge, got %v", err)
+	}
+}
+
 
 
 

@@ -38,6 +38,11 @@ type ResequencerConfig struct {
 	OnEmit func(seq uint64, packet []byte)
 }
 
+type pendingPacket struct {
+	data     []byte
+	isPooled bool
+}
+
 // InOrderResequencer guarantees strictly monotonic in-order packet delivery.
 // In asymmetric multi-path routing or delayed RLNC Gaussian substitution, packets may arrive with slight jitter.
 // By reordering packets before delivering to the higher layer (e.g. TUN device or TCP stack),
@@ -51,7 +56,7 @@ type InOrderResequencer struct {
 	allowLateDelivery bool
 	expectedSeq       uint64
 	initialized       bool
-	pending           map[uint64][]byte
+	pending           map[uint64]pendingPacket
 	emittedRing       [2048]uint64
 	timer             *time.Timer
 	onEmit            func(seq uint64, packet []byte)
@@ -81,7 +86,7 @@ func NewInOrderResequencerWithConfig(cfg ResequencerConfig) *InOrderResequencer 
 		maxPending:        maxPending,
 		zeroCopy:          cfg.ZeroCopy,
 		allowLateDelivery: cfg.AllowLateDelivery,
-		pending:           make(map[uint64][]byte),
+		pending:           make(map[uint64]pendingPacket),
 		onEmit:            cfg.OnEmit,
 		pendingEmit:       make([]reseqItem, 0, 16),
 	}
@@ -159,10 +164,19 @@ func (r *InOrderResequencer) Push(seq uint64, packet []byte) {
 	} else {
 		// diff > 0: future packet arrived out of order.
 		if _, exists := r.pending[seq]; !exists {
-			// Buffer in pooled slice.
-			buf := GetPacketBuffer()
-			n := copy(buf, packet)
-			r.pending[seq] = buf[:n]
+			var buf []byte
+			var isPooled bool
+			if len(packet) <= MaxPacketBufferSize {
+				buf = GetPacketBuffer()
+				n := copy(buf, packet)
+				buf = buf[:n]
+				isPooled = true
+			} else {
+				buf = make([]byte, len(packet))
+				copy(buf, packet)
+				isPooled = false
+			}
+			r.pending[seq] = pendingPacket{data: buf, isPooled: isPooled}
 			r.reordered++
 
 			if len(r.pending) >= r.maxPending {
@@ -282,15 +296,15 @@ func (r *InOrderResequencer) skipToLowestPendingLocked() {
 
 func (r *InOrderResequencer) drainConsecutiveLocked() {
 	for {
-		nextPkt, exists := r.pending[r.expectedSeq]
+		item, exists := r.pending[r.expectedSeq]
 		if !exists {
 			break
 		}
 		delete(r.pending, r.expectedSeq)
 		r.pendingEmit = append(r.pendingEmit, reseqItem{
 			seq:      r.expectedSeq,
-			pkt:      nextPkt,
-			isPooled: true,
+			pkt:      item.data,
+			isPooled: item.isPooled,
 		})
 		r.emittedRing[r.expectedSeq%2048] = r.expectedSeq
 		r.expectedSeq++
@@ -360,10 +374,12 @@ func (r *InOrderResequencer) Reset() {
 		r.timer.Stop()
 		r.timer = nil
 	}
-	for _, pkt := range r.pending {
-		PutPacketBuffer(pkt)
+	for _, item := range r.pending {
+		if item.isPooled {
+			PutPacketBuffer(item.data)
+		}
 	}
-	r.pending = make(map[uint64][]byte)
+	r.pending = make(map[uint64]pendingPacket)
 	for i := range r.emittedRing {
 		r.emittedRing[i] = ^uint64(0)
 	}

@@ -300,6 +300,9 @@ func (d *IncrementalDecoder) recordAndEmitSolved(seq uint64, data []byte) {
 	rec.len = totalRecordLen
 	rec.solved = true
 	copy(rec.data[:totalRecordLen], data[:totalRecordLen])
+	if totalRecordLen < len(rec.data) {
+		ClearBytes(rec.data[totalRecordLen:])
+	}
 
 	d.packetsDecoded.Add(1)
 

@@ -129,6 +129,9 @@ func (d *IncrementalDecoder) PushShard(shard Shard) (recovered [][]byte, err err
 	if len(shard.Data) < LengthPrefixSize {
 		return nil, ErrCorruptHeader
 	}
+	if len(shard.Data) > LengthPrefixSize+d.symbolSize {
+		return nil, ErrPayloadTooLarge
+	}
 
 	d.mu.Lock()
 	d.shardsReceived.Add(1)
