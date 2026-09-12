@@ -1006,6 +1006,22 @@ func TestInOrderResequencer_ZeroCopyVsSafeOwnership(t *testing.T) {
 		t.Fatalf("zero-copy mode delivery failed")
 	}
 	reseqZero.Close()
+
+	// 3. Verify Close() flushes pending out-of-order packets with safe copy
+	var capturedCloseSafe [][]byte
+	reseqClose := NewInOrderResequencer(5*time.Second, 10, func(seq uint64, pkt []byte) {
+		capturedCloseSafe = append(capturedCloseSafe, pkt)
+	})
+	reseqClose.Push(5, []byte("pending-pkt-5"))
+	reseqClose.Close()
+	if len(capturedCloseSafe) != 1 || !bytes.Equal(capturedCloseSafe[0], []byte("pending-pkt-5")) {
+		t.Fatalf("Close flush failed")
+	}
+
+	// 4. Verify Close() with nil onEmit safely returns pooled buffers without panic or leak
+	reseqNil := NewInOrderResequencer(5*time.Second, 10, nil)
+	reseqNil.Push(10, []byte("pending-pkt-10"))
+	reseqNil.Close()
 }
 
 // 23. Test IncrementalDecoder pivot eviction telemetry on ring wrap-around

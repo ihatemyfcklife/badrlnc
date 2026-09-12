@@ -322,7 +322,14 @@ func (r *InOrderResequencer) Close() {
 
 	for i := range toEmit {
 		if r.onEmit != nil {
-			r.onEmit(toEmit[i].seq, toEmit[i].pkt)
+			var out []byte
+			if r.zeroCopy {
+				out = toEmit[i].pkt
+			} else {
+				out = make([]byte, len(toEmit[i].pkt))
+				copy(out, toEmit[i].pkt)
+			}
+			r.onEmit(toEmit[i].seq, out)
 		}
 		if toEmit[i].isPooled {
 			PutPacketBuffer(toEmit[i].pkt)
