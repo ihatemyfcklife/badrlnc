@@ -159,6 +159,8 @@ Simulated over an erasure channel ($W=32$, $N=120$ packets) under both uniform a
 go get github.com/ihatemyfcklife/badrlnc
 ```
 
+Package documentation and API reference are available on [pkg.go.dev/github.com/ihatemyfcklife/badrlnc](https://pkg.go.dev/github.com/ihatemyfcklife/badrlnc).
+
 > **Requirements:** Go 1.23 or higher. No CGO required. No external dependencies.
 
 ---
