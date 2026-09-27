@@ -43,6 +43,10 @@ type EncoderConfig struct {
 	// When enabled, shards are encoded with FlagChecksum (0x04) in wire headers,
 	// enabling DecodeShard to detect bit flips and pollution attacks with hardware acceleration.
 	Checksum bool
+
+	// InitialSeq specifies the starting sequence number for the first pushed packet.
+	// Default is 0. Enables seamless generation-based encoding partitioned by batches.
+	InitialSeq uint64
 }
 
 type encoderEntry struct {
@@ -120,7 +124,7 @@ func NewSlidingEncoder(cfg EncoderConfig) *SlidingWindowEncoder {
 		zeroCopy:          cfg.ZeroCopy,
 		checksum:          cfg.Checksum,
 		entries:           entries,
-		nextSeq:           0,
+		nextSeq:           cfg.InitialSeq,
 		rngState:          seed,
 		parityBuf:         make([]byte, internalSymbolCapacity),
 	}
