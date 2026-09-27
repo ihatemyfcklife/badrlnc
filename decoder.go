@@ -1,4 +1,4 @@
-package rlnc
+package badrlnc
 
 import (
 	"sync"
@@ -98,7 +98,7 @@ func NewIncrementalDecoder(cfg DecoderConfig) *IncrementalDecoder {
 	}
 
 	if cfg.ZeroCopy && cfg.OnDecoded == nil {
-		panic("rlnc: ZeroCopy mode requires configuring OnDecoded callback to prevent slice aliasing")
+		panic("badrlnc: ZeroCopy mode requires configuring OnDecoded callback to prevent slice aliasing")
 	}
 
 	return &IncrementalDecoder{

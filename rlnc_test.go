@@ -1,4 +1,4 @@
-package rlnc
+package badrlnc
 
 import (
 	"bytes"
@@ -1253,9 +1253,12 @@ func TestGaussJordan_HigherVariablesWithoutPivotNoInfiniteLoop(t *testing.T) {
 // 26. Test that InOrderResequencer enforces strictly monotonic ordering by default and drops late packets
 func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) {
 	// 1. Default mode: AllowLateDelivery is false -> strictly monotonic delivery guaranteed
+	var muDefault sync.Mutex
 	var deliveredDefault []uint64
 	reseqDefault := NewInOrderResequencer(10*time.Millisecond, 10, func(seq uint64, pkt []byte) {
+		muDefault.Lock()
 		deliveredDefault = append(deliveredDefault, seq)
+		muDefault.Unlock()
 	})
 
 	reseqDefault.Push(0, []byte("pkt-0"))
@@ -1265,17 +1268,25 @@ func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) 
 	// Wait for gap skip timer to expire (timeout on 1 -> force skip to 2)
 	time.Sleep(30 * time.Millisecond)
 
+	muDefault.Lock()
+	snapDefault := append([]uint64(nil), deliveredDefault...)
+	muDefault.Unlock()
+
 	// Delivered should now be [0, 2]
-	if len(deliveredDefault) != 2 || deliveredDefault[0] != 0 || deliveredDefault[1] != 2 {
-		t.Fatalf("expected [0, 2] delivered after gap skip, got %v", deliveredDefault)
+	if len(snapDefault) != 2 || snapDefault[0] != 0 || snapDefault[1] != 2 {
+		t.Fatalf("expected [0, 2] delivered after gap skip, got %v", snapDefault)
 	}
 
 	// Now deliver missing packet 1 (retrograde arrival)
 	reseqDefault.Push(1, []byte("pkt-1-late"))
 
+	muDefault.Lock()
+	snapDefault = append([]uint64(nil), deliveredDefault...)
+	muDefault.Unlock()
+
 	// Packet 1 MUST NOT be emitted (delivered remains [0, 2]) to prevent TCP ACK duplicates
-	if len(deliveredDefault) != 2 {
-		t.Fatalf("strict monotonicity violated: late retrograde packet was emitted: %v", deliveredDefault)
+	if len(snapDefault) != 2 {
+		t.Fatalf("strict monotonicity violated: late retrograde packet was emitted: %v", snapDefault)
 	}
 	if reseqDefault.StalePackets() != 1 {
 		t.Fatalf("expected 1 stale packet counted, got %d", reseqDefault.StalePackets())
@@ -1283,13 +1294,16 @@ func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) 
 	reseqDefault.Close()
 
 	// 2. Explicit AllowLateDelivery: true mode -> permits retrograde delivery if desired
+	var muLate sync.Mutex
 	var deliveredLate []uint64
 	reseqLate := NewInOrderResequencerWithConfig(ResequencerConfig{
 		MaxWait:           10 * time.Millisecond,
 		MaxPending:        10,
 		AllowLateDelivery: true,
 		OnEmit: func(seq uint64, pkt []byte) {
+			muLate.Lock()
 			deliveredLate = append(deliveredLate, seq)
+			muLate.Unlock()
 		},
 	})
 
@@ -1300,9 +1314,20 @@ func TestInOrderResequencer_StrictMonotonicityVsAllowLateDelivery(t *testing.T) 
 	// Now deliver missing packet 1
 	reseqLate.Push(1, []byte("pkt-1-late"))
 
+	muLate.Lock()
+	countLate := len(deliveredLate)
+	var lastLate uint64
+	if countLate == 3 {
+		lastLate = deliveredLate[2]
+	}
+	muLate.Unlock()
+
 	// With AllowLateDelivery: true, packet 1 IS delivered as retrograde packet [0, 2, 1]
-	if len(deliveredLate) != 3 || deliveredLate[2] != 1 {
-		t.Fatalf("expected late packet delivered when AllowLateDelivery: true, got %v", deliveredLate)
+	if countLate != 3 || lastLate != 1 {
+		muLate.Lock()
+		snapshot := append([]uint64(nil), deliveredLate...)
+		muLate.Unlock()
+		t.Fatalf("expected late packet delivered when AllowLateDelivery: true, got %v", snapshot)
 	}
 	if reseqLate.StalePackets() != 0 {
 		t.Fatalf("expected 0 stale packets when late delivery allowed, got %d", reseqLate.StalePackets())
@@ -1587,23 +1612,40 @@ func TestResequencer_TimerRace(t *testing.T) {
 
 // 35. Test InOrderResequencer session reset recovery on remote sender crash/restart
 func TestResequencer_SessionReset(t *testing.T) {
+	var mu sync.Mutex
 	var delivered []uint64
 	reseq := NewInOrderResequencerWithConfig(ResequencerConfig{
 		MaxWait:             20 * time.Millisecond,
 		MaxPending:          64,
 		MaxConsecutiveStale: 10,
 		OnEmit: func(seq uint64, pkt []byte) {
+			mu.Lock()
 			delivered = append(delivered, seq)
+			mu.Unlock()
 		},
 	})
 	defer reseq.Close()
+
+	getDelivered := func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		cpy := make([]uint64, len(delivered))
+		copy(cpy, delivered)
+		return cpy
+	}
+
+	clearDelivered := func() {
+		mu.Lock()
+		delivered = delivered[:0]
+		mu.Unlock()
+	}
 
 	// Stream established: sender sends packets 0..50
 	for i := uint64(0); i <= 50; i++ {
 		reseq.Push(i, []byte{byte(i)})
 	}
-	if len(delivered) != 51 {
-		t.Fatalf("expected 51 delivered packets, got %d", len(delivered))
+	if len(getDelivered()) != 51 {
+		t.Fatalf("expected 51 delivered packets, got %d", len(getDelivered()))
 	}
 
 	// Case A: Sender crashes and restarts at seq = 0 (diff <= -backwardJumpThreshold)
@@ -1611,19 +1653,20 @@ func TestResequencer_SessionReset(t *testing.T) {
 	reseq.Push(20000, []byte("pkt-20000"))
 	time.Sleep(30 * time.Millisecond) // gap skipped, expectedSeq becomes 20,001
 
-	delivered = delivered[:0]
+	clearDelivered()
 
 	// Remote restarted at seq = 0: first 2 packets are guarded against false-positive single ghost replay
 	reseq.Push(0, []byte("restart-0"))
 	reseq.Push(1, []byte("restart-1"))
-	if len(delivered) != 0 {
-		t.Fatalf("first 2 packets should be guarded as potential replayed ghosts, got: %v", delivered)
+	if len(getDelivered()) != 0 {
+		t.Fatalf("first 2 packets should be guarded as potential replayed ghosts, got: %v", getDelivered())
 	}
 
 	// 3rd consecutive packet confirms session restart!
 	reseq.Push(2, []byte("restart-2"))
-	if len(delivered) != 1 || delivered[0] != 2 {
-		t.Fatalf("expected session reset confirmed on 3rd packet, got: %v", delivered)
+	d := getDelivered()
+	if len(d) != 1 || d[0] != 2 {
+		t.Fatalf("expected session reset confirmed on 3rd packet, got: %v", d)
 	}
 
 	// Case B: Remote restarted at seq = 4800 (diff = -200, within backwardJumpThreshold)
@@ -1632,26 +1675,28 @@ func TestResequencer_SessionReset(t *testing.T) {
 		reseq.Push(i, []byte("fast-forward"))
 	}
 
-	delivered = delivered[:0]
+	clearDelivered()
 	// Sender restarted at 4800. Expected is 5001.
 	// Send 9 retrograde packets (less than MaxConsecutiveStale = 10)
 	for i := uint64(0); i < 9; i++ {
 		reseq.Push(4800+i, []byte("retrograde"))
 	}
-	if len(delivered) != 0 {
-		t.Fatalf("retrograde packets before threshold should be discarded, got: %v", delivered)
+	if len(getDelivered()) != 0 {
+		t.Fatalf("retrograde packets before threshold should be discarded, got: %v", getDelivered())
 	}
 
 	// 10th retrograde packet reaches MaxConsecutiveStale (10) -> triggers session reset!
 	reseq.Push(4809, []byte("retrograde-reset"))
-	if len(delivered) != 1 || delivered[0] != 4809 {
-		t.Fatalf("expected session reset on 10th consecutive retrograde packet, got: %v", delivered)
+	d = getDelivered()
+	if len(d) != 1 || d[0] != 4809 {
+		t.Fatalf("expected session reset on 10th consecutive retrograde packet, got: %v", d)
 	}
 
 	// Subsequent packets continue monotonically
 	reseq.Push(4810, []byte("packet-4810"))
-	if len(delivered) != 2 || delivered[1] != 4810 {
-		t.Fatalf("expected packet 4810 delivered in order, got: %v", delivered)
+	d = getDelivered()
+	if len(d) != 2 || d[1] != 4810 {
+		t.Fatalf("expected packet 4810 delivered in order, got: %v", d)
 	}
 }
 

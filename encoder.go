@@ -1,4 +1,4 @@
-package rlnc
+package badrlnc
 
 import (
 	"crypto/rand"

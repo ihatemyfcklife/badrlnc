@@ -1,4 +1,4 @@
-package rlnc
+package badrlnc
 
 import (
 	"encoding/binary"
@@ -57,16 +57,16 @@ const (
 )
 
 var (
-	ErrZeroPayload         = errors.New("rlnc: payload cannot be empty")
-	ErrPayloadTooLarge     = errors.New("rlnc: payload exceeds configured SymbolSize")
-	ErrCorruptHeader       = errors.New("rlnc: shard header corrupted or smaller than expected size")
-	ErrInvalidVersion      = errors.New("rlnc: invalid protocol version")
-	ErrBufferTooSmall      = errors.New("rlnc: destination buffer too small for operation")
-	ErrWindowOverflow      = errors.New("rlnc: sliding window overflow")
-	ErrSequenceOutOfWindow = errors.New("rlnc: sequence number is outside active window")
-	ErrNoPivotsAvailable   = errors.New("rlnc: no linear pivots available")
-	ErrLinearlyDependent   = errors.New("rlnc: symbol is linearly dependent (zero innovation)")
-	ErrChecksumMismatch    = errors.New("rlnc: shard checksum mismatch (data corruption detected)")
+	ErrZeroPayload         = errors.New("badrlnc: payload cannot be empty")
+	ErrPayloadTooLarge     = errors.New("badrlnc: payload exceeds configured SymbolSize")
+	ErrCorruptHeader       = errors.New("badrlnc: shard header corrupted or smaller than expected size")
+	ErrInvalidVersion      = errors.New("badrlnc: invalid protocol version")
+	ErrBufferTooSmall      = errors.New("badrlnc: destination buffer too small for operation")
+	ErrWindowOverflow      = errors.New("badrlnc: sliding window overflow")
+	ErrSequenceOutOfWindow = errors.New("badrlnc: sequence number is outside active window")
+	ErrNoPivotsAvailable   = errors.New("badrlnc: no linear pivots available")
+	ErrLinearlyDependent   = errors.New("badrlnc: symbol is linearly dependent (zero innovation)")
+	ErrChecksumMismatch    = errors.New("badrlnc: shard checksum mismatch (data corruption detected)")
 )
 
 var crc32CastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
